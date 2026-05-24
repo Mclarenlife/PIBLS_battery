@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sagd-l2", type=float, default=1e-6)
     parser.add_argument("--hard-sagd-epochs", type=int, default=15_000)
     parser.add_argument("--hard-sagd-lr", type=float, default=1.5e-3)
+    parser.add_argument("--hard-trial", choices=["decay", "stationary"], default="stationary")
     parser.add_argument("--ic-weight", type=float, default=100.0)
     parser.add_argument("--bc-weight", type=float, default=100.0)
     parser.add_argument("--pibls-ridge", type=float, default=1e-10)
@@ -248,17 +249,29 @@ class SAGDBLSStandardBurgers:
         }
 
 
-def trial_components(x: np.ndarray, t: np.ndarray) -> dict[str, np.ndarray]:
+def trial_components(x: np.ndarray, t: np.ndarray, hard_trial: str) -> dict[str, np.ndarray]:
     """Analytic IC/BC envelope for standard Burgers."""
 
     u0 = initial_condition(x)
     u0_x = -np.pi * np.cos(np.pi * x)
     u0_xx = (np.pi**2) * np.sin(np.pi * x)
+    if hard_trial == "decay":
+        base = (1.0 - t) * u0
+        base_x = (1.0 - t) * u0_x
+        base_t = -u0
+        base_xx = (1.0 - t) * u0_xx
+    elif hard_trial == "stationary":
+        base = u0
+        base_x = u0_x
+        base_t = np.zeros_like(u0)
+        base_xx = u0_xx
+    else:
+        raise ValueError("hard_trial must be 'decay' or 'stationary'.")
     return {
-        "base": (1.0 - t) * u0,
-        "base_x": (1.0 - t) * u0_x,
-        "base_t": -u0,
-        "base_xx": (1.0 - t) * u0_xx,
+        "base": base,
+        "base_x": base_x,
+        "base_t": base_t,
+        "base_xx": base_xx,
         "envelope": t * (1.0 - x * x),
         "envelope_x": -2.0 * t * x,
         "envelope_t": 1.0 - x * x,
@@ -273,6 +286,7 @@ class SAGDBLSHardICBCStandardBurgers:
     learning_rate: float
     epochs: int
     l2: float
+    hard_trial: str
 
     beta_: np.ndarray | None = field(init=False, default=None)
     training_summary_: dict[str, float] = field(init=False, default_factory=dict)
@@ -373,8 +387,8 @@ class SAGDBLSHardICBCStandardBurgers:
             "regularization": regularization,
         }
 
-    @staticmethod
     def _u_and_derivatives(
+        self,
         x: np.ndarray,
         t: np.ndarray,
         phi: np.ndarray,
@@ -383,7 +397,7 @@ class SAGDBLSHardICBCStandardBurgers:
         phi_xx: np.ndarray | None,
         beta: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        terms = trial_components(x, t)
+        terms = trial_components(x, t, self.hard_trial)
         v = phi @ beta
         u = terms["base"] + terms["envelope"] * v
         values: dict[str, np.ndarray] = {"u": u}
@@ -452,10 +466,18 @@ def run_sagd(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray])
 def run_sagd_hard_icbc(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
     start = time.perf_counter()
     feature = BroadFeature2D(args.n_map, args.n_enhance, args.activation[0], args.activation[1], seed)
-    model = SAGDBLSHardICBCStandardBurgers(feature, args.nu, args.hard_sagd_lr, args.hard_sagd_epochs, args.sagd_l2)
+    model = SAGDBLSHardICBCStandardBurgers(
+        feature,
+        args.nu,
+        args.hard_sagd_lr,
+        args.hard_sagd_epochs,
+        args.sagd_l2,
+        args.hard_trial,
+    )
     model.fit(points)
     metrics = evaluate_model(model.predict, model.residual, points)
-    return make_row(args, "SAGD-BLS-hard-ICBC", seed, time.perf_counter() - start, feature.width, model.training_summary_, metrics)
+    method = "SAGD-BLS-hard-ICBC" if args.hard_trial == "decay" else "SAGD-BLS-hard-ICBC-stationary"
+    return make_row(args, method, seed, time.perf_counter() - start, feature.width, model.training_summary_, metrics)
 
 
 def run_pibls_linearized(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
@@ -581,7 +603,7 @@ def make_row(
 ) -> dict[str, object]:
     is_bls = "BLS" in method or "PIBLS" in method
     is_sagd = method == "SAGD-BLS-standard-Burgers"
-    is_hard_sagd = method == "SAGD-BLS-hard-ICBC"
+    is_hard_sagd = method.startswith("SAGD-BLS-hard-ICBC")
     row = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "problem": "Standard unforced Burgers",
@@ -592,6 +614,7 @@ def make_row(
         "n_enhance": args.n_enhance if is_bls else "",
         "map_activation": args.activation[0] if is_bls else "tanh",
         "enhance_activation": args.activation[1] if is_bls else "",
+        "hard_trial": args.hard_trial if is_hard_sagd else "",
         "n_collocation": args.n_collocation,
         "n_initial": args.n_initial,
         "n_boundary": args.n_boundary,
@@ -660,7 +683,7 @@ def main() -> None:
         if not args.skip_hard_sagd:
             sagd_hard = run_sagd_hard_icbc(args, seed, points)
             rows.append(sagd_hard)
-            print(f"SAGD-BLS-hard-ICBC seed={seed}: MAE={sagd_hard['MAE']:.6e}, RMSE={sagd_hard['RMSE']:.6e}")
+            print(f"{sagd_hard['method']} seed={seed}: MAE={sagd_hard['MAE']:.6e}, RMSE={sagd_hard['RMSE']:.6e}")
 
         if not args.skip_pibls:
             pibls = run_pibls_linearized(args, seed, points)

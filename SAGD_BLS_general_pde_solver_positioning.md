@@ -571,11 +571,59 @@ SAGD-BLS 可以直接把 `u` 表示成固定随机基函数的线性组合：
 推荐配置运行命令：
 
 ```powershell
-.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --results-csv results\standard_burgers_hard_icbc_lr15e4_15k_results.csv --summary-csv results\standard_burgers_hard_icbc_lr15e4_15k_summary.csv
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --hard-trial decay --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --results-csv results\standard_burgers_hard_icbc_lr15e4_15k_results.csv --summary-csv results\standard_burgers_hard_icbc_lr15e4_15k_summary.csv
 ```
 
 当前结论：
 
-Hard-ICBC trial solution 是有效改进。最高精度配置的 MAE 从 soft 版的 `0.1398` 降到 `0.1136`，已经低于当前 PINN 单 seed 的 `0.1175`；推荐配置 `15000 epoch + lr=1.5e-3` 的 MAE 为 `0.1171`，也略低于 PINN，同时严格满足初值和边界条件。
+Hard-ICBC trial solution 是有效改进。最高精度配置的 MAE 从 soft 版的 `0.1398` 降到 `0.1136`，已经低于当前 PINN 单 seed 的 `0.1175`；decay trial 推荐配置 `15000 epoch + lr=1.5e-3` 的 MAE 为 `0.1171`，也略低于 PINN，同时严格满足初值和边界条件。
 
 需要谨慎表述的是：Hard-ICBC 版本虽然在 MAE 上略优于当前 PINN，但 RMSE 和 residual_RMSE 仍略高于 PINN，运行时间也更长。因此这不是“全面碾压 PINN”，而是证明通用 BLS-PDE 方向在标准无源 Burgers 难例上已经从落后推进到可竞争。下一步应优先优化效率和陡峭区域误差。
+
+## 18. Stationary Base Trial 消融
+
+为避免 hard trial 中的 `(1-t)u0(x)` 给 Burgers 演化施加过强的线性衰减先验，新增 `--hard-trial stationary` 选项。对应 trial solution 为：
+
+`u_hat(x,t) = u0(x) + t(1-x^2)v_beta(x,t)`
+
+它同样解析满足：
+
+- `u_hat(x,0)=u0(x)`
+- `u_hat(-1,t)=0`
+- `u_hat(1,t)=0`
+
+与 decay trial 相比，stationary trial 不再假设初始波形会随时间线性衰减，BLS 只需要学习 Burgers 演化相对初值的修正项。
+
+运行命令：
+
+```powershell
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --hard-trial stationary --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --results-csv results\standard_burgers_hard_icbc_stationary_15k_results.csv --summary-csv results\standard_burgers_hard_icbc_stationary_15k_summary.csv
+
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --hard-trial stationary --hard-sagd-epochs 40000 --hard-sagd-lr 0.0005 --results-csv results\standard_burgers_hard_icbc_stationary_40k_results.csv --summary-csv results\standard_burgers_hard_icbc_stationary_40k_summary.csv
+```
+
+单 seed 消融结果：
+
+| 配置 | MAE | RMSE | residual_RMSE | IC MAXAE | BC MAXAE | 运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| decay, 15000 epoch, lr=1.5e-3 | 1.171445e-01 | 2.264927e-01 | 5.668843e-01 | 0.000000e+00 | 1.224647e-16 | 199.903s |
+| stationary, 15000 epoch, lr=1.5e-3 | 1.170710e-01 | 2.265148e-01 | 5.668790e-01 | 0.000000e+00 | 1.224647e-16 | 197.753s |
+| decay, 40000 epoch, lr=5e-4 | 1.135707e-01 | 2.237811e-01 | 5.617356e-01 | 0.000000e+00 | 1.224647e-16 | 534.594s |
+| stationary, 40000 epoch, lr=5e-4 | 1.135364e-01 | 2.235604e-01 | 5.616979e-01 | 0.000000e+00 | 1.224647e-16 | 532.118s |
+
+结果文件：
+
+- `results/standard_burgers_hard_icbc_stationary_15k_results.csv`
+- `results/standard_burgers_hard_icbc_stationary_15k_summary.csv`
+- `results/standard_burgers_hard_icbc_stationary_40k_results.csv`
+- `results/standard_burgers_hard_icbc_stationary_40k_summary.csv`
+
+当前结论：
+
+stationary base 的方向是正确的，但提升很小。15k 配置的 MAE 从 `0.1171445` 降到 `0.1170710`，40k 配置的 MAE 从 `0.1135707` 降到 `0.1135364`。这说明线性衰减先验不是当前主要瓶颈；主要瓶颈更可能来自固定随机宽度特征对低粘性 Burgers 陡峭过渡区的表达能力。
+
+因此，后续改进不宜继续堆外部模块，而应限定在 BLS 变体内部：
+
+1. 特征字典本体：宽度、激活函数、随机权重尺度、输入缩放。
+2. 输出层优化：仍然只优化 `beta`，可比较 Adam、L-BFGS 或二者的 beta-only 阶段化优化。
+3. 硬约束表达：保留 stationary base 作为默认 hard trial，因为它更自然且略优。
