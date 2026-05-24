@@ -743,3 +743,62 @@ L2 正则提供了一个有用的折中：`240/240, l2=1e-2` 的 MAE 为 `0.0889
 - **拟合-残差折中配置**：`sin/tanh, map_scale=4, n_map=240, n_enhance=240, l2=1e-2`
 
 下一步建议先做三 seed 稳定性验证，而不是继续堆新技巧。若三 seed 仍稳定优于 PINN 的 MAE/RMSE，就可以把 HC-SAGD-BLS 的标准 Burgers 结果作为主要 PDE 证据之一。
+
+## 21. PyTorch/CUDA 后端验证
+
+为判断运行时间劣势是否来自 NumPy 实现，本轮新增 `--bls-backend torch` 后端。该后端没有改变方法结构：
+
+- `W_map/W_enhance` 仍然固定随机生成，不训练；
+- `Phi(x,t)` 仍然是 BLS mapping/enhancement 宽度特征；
+- 训练参数仍然只有单个输出层 `beta`；
+- 仍然使用手写 Burgers residual 和手写 beta-Adam，不使用 PINN 网络。
+
+新增命令行参数：
+
+- `--bls-backend numpy|torch`
+- `--device auto|cpu|cuda`
+- `--torch-dtype float32|float64`
+
+本机环境：
+
+- GPU：NVIDIA GeForce RTX 3060 Laptop GPU
+- CUDA torch：`torch 2.11.0+cu128`
+- 实验使用：`--device cuda --torch-dtype float32`
+
+GPU 运行命令示例：
+
+```powershell
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --bls-backend torch --device cuda --torch-dtype float32 --hard-trial stationary --hard-sagd-epochs 5000 --hard-sagd-lr 0.0015 --sagd-l2 0.000001 --activation sin tanh --map-scale 4.0 --enhance-scale 1.0 --n-map 240 --n-enhance 240 --results-csv results\standard_burgers_torch_cuda_w240_5k_results.csv --summary-csv results\standard_burgers_torch_cuda_w240_5k_summary.csv
+
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --bls-backend torch --device cuda --torch-dtype float32 --hard-trial stationary --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --sagd-l2 0.000001 --activation sin tanh --map-scale 4.0 --enhance-scale 1.0 --n-map 240 --n-enhance 240 --results-csv results\standard_burgers_torch_cuda_w240_15k_results.csv --summary-csv results\standard_burgers_torch_cuda_w240_15k_summary.csv
+
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --bls-backend torch --device cuda --torch-dtype float32 --hard-trial stationary --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --sagd-l2 0.01 --activation sin tanh --map-scale 4.0 --enhance-scale 1.0 --n-map 240 --n-enhance 240 --results-csv results\standard_burgers_torch_cuda_w240_l2e2_15k_results.csv --summary-csv results\standard_burgers_torch_cuda_w240_l2e2_15k_summary.csv
+```
+
+结果汇总：
+
+| 配置 | backend | epoch | MAE | RMSE | residual_RMSE | 运行时间 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| PINN baseline | PyTorch CPU | 5000 | 1.174917e-01 | 2.197461e-01 | 5.477191e-01 | 78.960s |
+| HC-SAGD-BLS 240/240, l2=1e-6 | NumPy CPU | 5000 | 8.817378e-02 | 1.820099e-01 | 6.035866e-01 | 102.199s |
+| HC-SAGD-BLS 240/240, l2=1e-6 | Torch CUDA | 5000 | 8.822340e-02 | 1.818501e-01 | 6.033430e-01 | 9.510s |
+| HC-SAGD-BLS 240/240, l2=1e-6 | NumPy CPU | 15000 | 8.669216e-02 | 1.788374e-01 | 6.322830e-01 | 306.106s |
+| HC-SAGD-BLS 240/240, l2=1e-6 | Torch CUDA | 15000 | 8.669523e-02 | 1.789226e-01 | 6.320071e-01 | 32.482s |
+| HC-SAGD-BLS 240/240, l2=1e-2 | NumPy CPU | 15000 | 8.894163e-02 | 1.837938e-01 | 5.833702e-01 | 305.352s |
+| HC-SAGD-BLS 240/240, l2=1e-2 | Torch CUDA | 15000 | 8.892135e-02 | 1.837605e-01 | 5.828701e-01 | 32.704s |
+
+结果文件：
+
+- `results/standard_burgers_torch_cuda_summary.csv`
+- `results/standard_burgers_torch_cuda_w240_5k_results.csv`
+- `results/standard_burgers_torch_cuda_w240_5k_summary.csv`
+- `results/standard_burgers_torch_cuda_w240_15k_results.csv`
+- `results/standard_burgers_torch_cuda_w240_15k_summary.csv`
+- `results/standard_burgers_torch_cuda_w240_l2e2_15k_results.csv`
+- `results/standard_burgers_torch_cuda_w240_l2e2_15k_summary.csv`
+
+当前结论：
+
+运行时间劣势主要来自 NumPy 实现，而不是 HC-SAGD-BLS 方法本身。Torch/CUDA 后端在保持几乎相同 MAE/RMSE/residual 的情况下，把 `240/240, 5000 epoch` 的时间从 `102.2s` 降到 `9.5s`，把 `15000 epoch` 的时间从约 `306s` 降到约 `32.5s`。
+
+因此，和 PINN 的速度对比需要更新：在 GPU 后端下，HC-SAGD-BLS 的 5000 epoch 运行时间已经明显低于当前 PINN baseline，同时 MAE/RMSE 也明显更低。需要保留的谨慎点是：当前 PINN baseline 还没有 GPU 重跑，且 HC-SAGD-BLS 的 residual_RMSE 仍未超过 PINN。

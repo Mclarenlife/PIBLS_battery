@@ -68,6 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-hard-sagd", action="store_true")
     parser.add_argument("--skip-pibls", action="store_true")
     parser.add_argument("--skip-pinn", action="store_true")
+    parser.add_argument("--bls-backend", choices=["numpy", "torch"], default="numpy")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--torch-dtype", choices=["float32", "float64"], default="float32")
     parser.add_argument("--torch-threads", type=int, default=0)
     return parser.parse_args()
 
@@ -468,6 +471,309 @@ def make_feature(args: argparse.Namespace, seed: int) -> BroadFeature2D:
     )
 
 
+def resolve_torch_device(device_name: str) -> torch.device:
+    if device_name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but this Python environment has CPU-only torch.")
+    return torch.device(device_name)
+
+
+def resolve_torch_dtype(dtype_name: str) -> torch.dtype:
+    return torch.float32 if dtype_name == "float32" else torch.float64
+
+
+def sync_torch_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def torch_activation_with_derivatives(values: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = name.lower()
+    if key == "tanh":
+        y = torch.tanh(values)
+        dy = 1.0 - y * y
+        d2y = -2.0 * y * dy
+        return y, dy, d2y
+    if key == "sigmoid":
+        y = torch.sigmoid(torch.clamp(values, -60.0, 60.0))
+        dy = y * (1.0 - y)
+        d2y = dy * (1.0 - 2.0 * y)
+        return y, dy, d2y
+    if key == "sin":
+        return torch.sin(values), torch.cos(values), -torch.sin(values)
+    if key == "softplus":
+        clipped = torch.clamp(values, -60.0, 60.0)
+        sigmoid = torch.sigmoid(clipped)
+        y = torch.nn.functional.softplus(values)
+        return y, sigmoid, sigmoid * (1.0 - sigmoid)
+    if key == "linear":
+        return values, torch.ones_like(values), torch.zeros_like(values)
+    raise ValueError("Supported activations for torch BLS: tanh, sigmoid, sin, softplus, linear.")
+
+
+class TorchBroadFeature2D:
+    def __init__(self, numpy_feature: BroadFeature2D, device: torch.device, dtype: torch.dtype) -> None:
+        assert numpy_feature.input_mean_ is not None and numpy_feature.input_std_ is not None
+        assert numpy_feature.design_mean_ is not None and numpy_feature.design_std_ is not None
+        assert numpy_feature.W_map_ is not None and numpy_feature.b_map_ is not None
+        assert numpy_feature.W_enhance_ is not None and numpy_feature.b_enhance_ is not None
+        self.n_map = numpy_feature.n_map
+        self.n_enhance = numpy_feature.n_enhance
+        self.map_activation = numpy_feature.map_activation
+        self.enhance_activation = numpy_feature.enhance_activation
+        self.device = device
+        self.dtype = dtype
+        self.input_mean = torch.as_tensor(numpy_feature.input_mean_, device=device, dtype=dtype)
+        self.input_std = torch.as_tensor(numpy_feature.input_std_, device=device, dtype=dtype)
+        self.design_mean = torch.as_tensor(numpy_feature.design_mean_, device=device, dtype=dtype)
+        self.design_std = torch.as_tensor(numpy_feature.design_std_, device=device, dtype=dtype)
+        self.W_map = torch.as_tensor(numpy_feature.W_map_, device=device, dtype=dtype)
+        self.b_map = torch.as_tensor(numpy_feature.b_map_, device=device, dtype=dtype)
+        self.W_enhance = torch.as_tensor(numpy_feature.W_enhance_, device=device, dtype=dtype)
+        self.b_enhance = torch.as_tensor(numpy_feature.b_enhance_, device=device, dtype=dtype)
+
+    @property
+    def width(self) -> int:
+        return 3 + self.n_map + self.n_enhance
+
+    def as_tensor(self, values: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(values, device=self.device, dtype=self.dtype).reshape(-1)
+
+    def design_and_derivatives(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = torch.stack([x, t], dim=1)
+        z_scaled = (z - self.input_mean) / self.input_std
+        z_x = torch.zeros_like(z_scaled)
+        z_t = torch.zeros_like(z_scaled)
+        z_x[:, 0] = 1.0 / self.input_std[0]
+        z_t[:, 1] = 1.0 / self.input_std[1]
+
+        a_map = z_scaled @ self.W_map + self.b_map
+        h_map, h_map_prime, h_map_second = torch_activation_with_derivatives(a_map, self.map_activation)
+        a_map_x = z_x @ self.W_map
+        a_map_t = z_t @ self.W_map
+        h_map_x = h_map_prime * a_map_x
+        h_map_t = h_map_prime * a_map_t
+        h_map_xx = h_map_second * (a_map_x * a_map_x)
+
+        a_enhance = h_map @ self.W_enhance + self.b_enhance
+        h_enhance, h_enhance_prime, h_enhance_second = torch_activation_with_derivatives(
+            a_enhance,
+            self.enhance_activation,
+        )
+        a_enhance_x = h_map_x @ self.W_enhance
+        a_enhance_t = h_map_t @ self.W_enhance
+        a_enhance_xx = h_map_xx @ self.W_enhance
+        h_enhance_x = h_enhance_prime * a_enhance_x
+        h_enhance_t = h_enhance_prime * a_enhance_t
+        h_enhance_xx = h_enhance_second * (a_enhance_x * a_enhance_x) + h_enhance_prime * a_enhance_xx
+
+        ones = torch.ones_like(x).reshape(-1, 1)
+        zeros = torch.zeros_like(x).reshape(-1, 1)
+        raw = torch.cat([ones, z_scaled, h_map, h_enhance], dim=1)
+        raw_x = torch.cat([zeros, z_x, h_map_x, h_enhance_x], dim=1)
+        raw_t = torch.cat([zeros, z_t, h_map_t, h_enhance_t], dim=1)
+        raw_xx = torch.cat([zeros, torch.zeros_like(z_scaled), h_map_xx, h_enhance_xx], dim=1)
+        phi = torch.cat([ones, (raw[:, 1:] - self.design_mean) / self.design_std], dim=1)
+        phi_x = torch.cat([zeros, raw_x[:, 1:] / self.design_std], dim=1)
+        phi_t = torch.cat([zeros, raw_t[:, 1:] / self.design_std], dim=1)
+        phi_xx = torch.cat([zeros, raw_xx[:, 1:] / self.design_std], dim=1)
+        return phi, phi_x, phi_t, phi_xx
+
+
+def torch_trial_components(x: torch.Tensor, t: torch.Tensor, hard_trial: str) -> dict[str, torch.Tensor]:
+    pi = torch.as_tensor(np.pi, device=x.device, dtype=x.dtype)
+    u0 = -torch.sin(pi * x)
+    u0_x = -pi * torch.cos(pi * x)
+    u0_xx = (pi * pi) * torch.sin(pi * x)
+    if hard_trial == "decay":
+        base = (1.0 - t) * u0
+        base_x = (1.0 - t) * u0_x
+        base_t = -u0
+        base_xx = (1.0 - t) * u0_xx
+    elif hard_trial == "stationary":
+        base = u0
+        base_x = u0_x
+        base_t = torch.zeros_like(u0)
+        base_xx = u0_xx
+    else:
+        raise ValueError("hard_trial must be 'decay' or 'stationary'.")
+    return {
+        "base": base,
+        "base_x": base_x,
+        "base_t": base_t,
+        "base_xx": base_xx,
+        "envelope": t * (1.0 - x * x),
+        "envelope_x": -2.0 * t * x,
+        "envelope_t": 1.0 - x * x,
+        "envelope_xx": -2.0 * t,
+    }
+
+
+class TorchSAGDBLSHardICBCStandardBurgers:
+    def __init__(
+        self,
+        features: TorchBroadFeature2D,
+        nu: float,
+        learning_rate: float,
+        epochs: int,
+        l2: float,
+        hard_trial: str,
+    ) -> None:
+        self.features = features
+        self.nu = nu
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.l2 = l2
+        self.hard_trial = hard_trial
+        self.beta_: torch.Tensor | None = None
+        self.training_summary_: dict[str, object] = {}
+
+    def fit(self, points: dict[str, np.ndarray]) -> "TorchSAGDBLSHardICBCStandardBurgers":
+        x_col = self.features.as_tensor(points["x_col"])
+        t_col = self.features.as_tensor(points["t_col"])
+        phi, phi_x, phi_t, phi_xx = self.features.design_and_derivatives(x_col, t_col)
+        self.beta_ = self._adam_fit(x_col, t_col, phi, phi_x, phi_t, phi_xx)
+        self.training_summary_ = self.objective(x_col, t_col, phi, phi_x, phi_t, phi_xx, points, self.beta_)
+        return self
+
+    def predict(self, x: np.ndarray, t: np.ndarray) -> np.ndarray:
+        if self.beta_ is None:
+            raise ValueError("Model is not fitted.")
+        x_tensor = self.features.as_tensor(x)
+        t_tensor = self.features.as_tensor(t)
+        phi, _, _, _ = self.features.design_and_derivatives(x_tensor, t_tensor)
+        values = self._u_and_derivatives(x_tensor, t_tensor, phi, None, None, None, self.beta_)
+        return values["u"].detach().cpu().numpy().reshape(-1)
+
+    def residual(self, x: np.ndarray, t: np.ndarray) -> np.ndarray:
+        if self.beta_ is None:
+            raise ValueError("Model is not fitted.")
+        x_tensor = self.features.as_tensor(x)
+        t_tensor = self.features.as_tensor(t)
+        phi, phi_x, phi_t, phi_xx = self.features.design_and_derivatives(x_tensor, t_tensor)
+        values = self._u_and_derivatives(x_tensor, t_tensor, phi, phi_x, phi_t, phi_xx, self.beta_)
+        residual = values["u_t"] + values["u"] * values["u_x"] - self.nu * values["u_xx"]
+        return residual.detach().cpu().numpy().reshape(-1)
+
+    def _adam_fit(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        phi: torch.Tensor,
+        phi_x: torch.Tensor,
+        phi_t: torch.Tensor,
+        phi_xx: torch.Tensor,
+    ) -> torch.Tensor:
+        beta = torch.zeros(phi.shape[1], device=self.features.device, dtype=self.features.dtype)
+        m = torch.zeros_like(beta)
+        v = torch.zeros_like(beta)
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+        n_col = float(phi.shape[0])
+        for epoch in range(1, self.epochs + 1):
+            values = self._u_and_derivatives(x, t, phi, phi_x, phi_t, phi_xx, beta)
+            residual = values["u_t"] + values["u"] * values["u_x"] - self.nu * values["u_xx"]
+            jacobian = (
+                values["du_t"]
+                + values["u_x"][:, None] * values["du"]
+                + values["u"][:, None] * values["du_x"]
+                - self.nu * values["du_xx"]
+            )
+            grad = (2.0 / n_col) * (jacobian.T @ residual)
+            grad = grad + self.l2 * beta
+            m = beta1 * m + (1.0 - beta1) * grad
+            v = beta2 * v + (1.0 - beta2) * (grad * grad)
+            beta = beta - self.learning_rate * (m / (1.0 - beta1**epoch)) / (torch.sqrt(v / (1.0 - beta2**epoch)) + eps)
+        return beta
+
+    def objective(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        phi: torch.Tensor,
+        phi_x: torch.Tensor,
+        phi_t: torch.Tensor,
+        phi_xx: torch.Tensor,
+        points: dict[str, np.ndarray],
+        beta: torch.Tensor,
+    ) -> dict[str, object]:
+        values = self._u_and_derivatives(x, t, phi, phi_x, phi_t, phi_xx, beta)
+        residual = values["u_t"] + values["u"] * values["u_x"] - self.nu * values["u_xx"]
+        x_ic = self.features.as_tensor(points["x_ic"])
+        t_ic = self.features.as_tensor(points["t_ic"])
+        u_ic = self.features.as_tensor(points["u_ic"])
+        x_bc = self.features.as_tensor(points["x_bc"])
+        t_bc = self.features.as_tensor(points["t_bc"])
+        u_bc = self.features.as_tensor(points["u_bc"])
+        phi_ic, _, _, _ = self.features.design_and_derivatives(x_ic, t_ic)
+        phi_bc, _, _, _ = self.features.design_and_derivatives(x_bc, t_bc)
+        ic_pred = self._u_and_derivatives(x_ic, t_ic, phi_ic, None, None, None, beta)["u"]
+        bc_pred = self._u_and_derivatives(x_bc, t_bc, phi_bc, None, None, None, beta)["u"]
+        ic_res = ic_pred - u_ic
+        bc_res = bc_pred - u_bc
+        residual_loss = torch.mean(residual * residual)
+        regularization = 0.5 * self.l2 * torch.dot(beta, beta)
+        return {
+            "loss": float((residual_loss + regularization).detach().cpu()),
+            "residual_loss": float(residual_loss.detach().cpu()),
+            "ic_loss": float(torch.mean(ic_res * ic_res).detach().cpu()),
+            "bc_loss": float(torch.mean(bc_res * bc_res).detach().cpu()),
+            "regularization": float(regularization.detach().cpu()),
+            "device": str(self.features.device),
+            "torch_dtype": str(self.features.dtype).replace("torch.", ""),
+        }
+
+    def _u_and_derivatives(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        phi: torch.Tensor,
+        phi_x: torch.Tensor | None,
+        phi_t: torch.Tensor | None,
+        phi_xx: torch.Tensor | None,
+        beta: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        terms = torch_trial_components(x, t, self.hard_trial)
+        v = phi @ beta
+        u = terms["base"] + terms["envelope"] * v
+        values: dict[str, torch.Tensor] = {"u": u}
+        if phi_x is None or phi_t is None or phi_xx is None:
+            return values
+        v_x = phi_x @ beta
+        v_t = phi_t @ beta
+        v_xx = phi_xx @ beta
+        u_x = terms["base_x"] + terms["envelope_x"] * v + terms["envelope"] * v_x
+        u_t = terms["base_t"] + terms["envelope_t"] * v + terms["envelope"] * v_t
+        u_xx = (
+            terms["base_xx"]
+            + terms["envelope_xx"] * v
+            + 2.0 * terms["envelope_x"] * v_x
+            + terms["envelope"] * v_xx
+        )
+        values.update(
+            {
+                "u_x": u_x,
+                "u_t": u_t,
+                "u_xx": u_xx,
+                "du": terms["envelope"][:, None] * phi,
+                "du_x": terms["envelope_x"][:, None] * phi + terms["envelope"][:, None] * phi_x,
+                "du_t": terms["envelope_t"][:, None] * phi + terms["envelope"][:, None] * phi_t,
+                "du_xx": (
+                    terms["envelope_xx"][:, None] * phi
+                    + 2.0 * terms["envelope_x"][:, None] * phi_x
+                    + terms["envelope"][:, None] * phi_xx
+                ),
+            }
+        )
+        return values
+
+
 def run_sagd(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
     start = time.perf_counter()
     feature = make_feature(args, seed)
@@ -491,6 +797,32 @@ def run_sagd_hard_icbc(args: argparse.Namespace, seed: int, points: dict[str, np
     model.fit(points)
     metrics = evaluate_model(model.predict, model.residual, points)
     method = "SAGD-BLS-hard-ICBC" if args.hard_trial == "decay" else "SAGD-BLS-hard-ICBC-stationary"
+    return make_row(args, method, seed, time.perf_counter() - start, feature.width, model.training_summary_, metrics)
+
+
+def run_sagd_hard_icbc_torch(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
+    device = resolve_torch_device(args.device)
+    dtype = resolve_torch_dtype(args.torch_dtype)
+    numpy_feature = make_feature(args, seed)
+    numpy_feature.fit(
+        np.concatenate([points["x_col"], points["x_ic"], points["x_bc"]]),
+        np.concatenate([points["t_col"], points["t_ic"], points["t_bc"]]),
+    )
+    feature = TorchBroadFeature2D(numpy_feature, device, dtype)
+    sync_torch_device(device)
+    start = time.perf_counter()
+    model = TorchSAGDBLSHardICBCStandardBurgers(
+        feature,
+        args.nu,
+        args.hard_sagd_lr,
+        args.hard_sagd_epochs,
+        args.sagd_l2,
+        args.hard_trial,
+    )
+    model.fit(points)
+    metrics = evaluate_model(model.predict, model.residual, points)
+    sync_torch_device(device)
+    method = "SAGD-BLS-hard-ICBC-torch" if args.hard_trial == "decay" else "SAGD-BLS-hard-ICBC-stationary-torch"
     return make_row(args, method, seed, time.perf_counter() - start, feature.width, model.training_summary_, metrics)
 
 
@@ -631,6 +963,9 @@ def make_row(
         "map_scale": args.map_scale if is_bls else "",
         "enhance_scale": args.enhance_scale if is_bls else "",
         "hard_trial": args.hard_trial if is_hard_sagd else "",
+        "bls_backend": args.bls_backend if is_hard_sagd else ("numpy" if is_bls else ""),
+        "device": training_summary.get("device", "cpu" if is_bls else ""),
+        "torch_dtype": training_summary.get("torch_dtype", ""),
         "n_collocation": args.n_collocation,
         "n_initial": args.n_initial,
         "n_boundary": args.n_boundary,
@@ -697,7 +1032,7 @@ def main() -> None:
             print(f"SAGD-BLS-standard-Burgers seed={seed}: MAE={sagd['MAE']:.6e}, RMSE={sagd['RMSE']:.6e}")
 
         if not args.skip_hard_sagd:
-            sagd_hard = run_sagd_hard_icbc(args, seed, points)
+            sagd_hard = run_sagd_hard_icbc_torch(args, seed, points) if args.bls_backend == "torch" else run_sagd_hard_icbc(args, seed, points)
             rows.append(sagd_hard)
             print(f"{sagd_hard['method']} seed={seed}: MAE={sagd_hard['MAE']:.6e}, RMSE={sagd_hard['RMSE']:.6e}")
 

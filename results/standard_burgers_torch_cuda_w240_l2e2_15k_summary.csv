@@ -1,0 +1,2 @@
+MAE_mean,MAE_std,MAXAE_mean,MAXAE_std,RMSE_mean,RMSE_std,bc_MAXAE_mean,bc_MAXAE_std,ic_MAXAE_mean,ic_MAXAE_std,method,n,problem,residual_RMSE_mean,residual_RMSE_std,runtime_sec_mean,runtime_sec_std,trainable_parameters
+0.08892134549787689,0.0,0.914634371708752,0.0,0.18376047851551858,0.0,8.742277657347586e-08,0.0,2.551395131972223e-07,0.0,SAGD-BLS-hard-ICBC-stationary-torch,1,Standard unforced Burgers,0.5828700661659241,0.0,32.70396489999257,0.0,483
