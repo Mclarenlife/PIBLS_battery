@@ -802,3 +802,60 @@ GPU 运行命令示例：
 运行时间劣势主要来自 NumPy 实现，而不是 HC-SAGD-BLS 方法本身。Torch/CUDA 后端在保持几乎相同 MAE/RMSE/residual 的情况下，把 `240/240, 5000 epoch` 的时间从 `102.2s` 降到 `9.5s`，把 `15000 epoch` 的时间从约 `306s` 降到约 `32.5s`。
 
 因此，和 PINN 的速度对比需要更新：在 GPU 后端下，HC-SAGD-BLS 的 5000 epoch 运行时间已经明显低于当前 PINN baseline，同时 MAE/RMSE 也明显更低。需要保留的谨慎点是：当前 PINN baseline 还没有 GPU 重跑，且 HC-SAGD-BLS 的 residual_RMSE 仍未超过 PINN。
+
+## 22. 新 BLS 字典回到电池 SimData 验证
+
+为回应“用这个新方法跑之前的电池实验”，本轮把 PDE 侧得到的两个改进迁回 BattNN SimData 工业验证：
+
+1. torch/CUDA 后端：只加速输出层 `beta` 的 Adam 训练，不训练随机层；
+2. BLS 特征字典尺度：增加 `map_scale/enhance_scale`，仍然是固定随机 mapping/enhancement nodes。
+
+电池任务不使用 PDE hard constraint，因为电池电压监督预测没有显式 PDE 初值/边界约束。这里保留原来的电池 state adapter：
+
+`current, t, cumsum(current), diff(current), RC states`
+
+脚本改动：
+
+- `sagd_bls_battery.py` 新增 `backend/device/torch_dtype/map_scale/enhance_scale`
+- `run_sagd_bls_sim.py` 新增对应命令行参数，并记录 `runtime_sec`
+
+直接迁移 PDE 字典的结果：
+
+```powershell
+.venv\Scripts\python.exe run_sagd_bls_sim.py --seeds 1 2 3 4 5 --activation sin tanh --n-map 240 --n-enhance 240 --epochs 20000 --lr 0.01 --l2 0.001 --backend torch --device cuda --torch-dtype float32 --map-scale 4.0 --enhance-scale 1.0 --skip-ablation --results-csv results\sagd_bls_sim_torch_featuredict_results.csv
+```
+
+| 配置 | MAE | MAPE | RMSE | 平均时间 |
+| --- | ---: | ---: | ---: | ---: |
+| BattNN recorded | 2.024296e-02 | 6.093001e-03 | 2.512529e-02 | - |
+| PDE 字典直接迁移：sin/tanh, 240/240, map_scale=4 | 1.823148e-02 ± 4.66e-03 | 5.703137e-03 ± 1.43e-03 | 2.882182e-02 ± 6.13e-03 | 11.818s |
+
+结论：PDE 字典直接迁移可以超过 BattNN 的 MAE，但不如旧的电池调优版本，说明 PDE 上有效的 `sin/tanh + 240/240` 并不是电池任务的最佳字典。
+
+然后只保留电池上原先较稳的 `tanh/sigmoid` 激活，测试随机尺度：
+
+| 配置 | MAE | MAPE | RMSE | 平均时间 |
+| --- | ---: | ---: | ---: | ---: |
+| old SAGD-BLS NumPy, tanh/sigmoid, 100/100, scale=1 | 5.621381e-03 ± 1.61e-03 | 1.759023e-03 ± 5.26e-04 | 9.498775e-03 ± 2.58e-03 | - |
+| torch CUDA, tanh/sigmoid, 100/100, scale=1 | 6.515044e-03 ± 1.98e-03 | 2.019996e-03 ± 6.15e-04 | 1.025217e-02 ± 2.67e-03 | 12.758s |
+| torch CUDA, tanh/sigmoid, 100/100, map_scale=2 | 7.286088e-03 ± 3.75e-03 | 2.222089e-03 ± 1.10e-03 | 1.066808e-02 ± 3.46e-03 | 13.159s |
+| torch CUDA, tanh/sigmoid, 100/100, map_scale=4 | 5.169893e-03 ± 6.52e-04 | 1.583273e-03 ± 1.98e-04 | 8.290102e-03 ± 6.62e-04 | 13.887s |
+| torch CUDA, tanh/sigmoid, 240/240, map_scale=4 | 2.955338e-02 ± 4.43e-02 | 8.910287e-03 ± 1.33e-02 | 3.475194e-02 ± 4.65e-02 | 13.001s |
+
+汇总文件：
+
+`results/sagd_bls_sim_torch_transfer_summary.csv`
+
+保留的正式结果文件：
+
+- `results/sagd_bls_sim_torch_featuredict_results.csv`
+- `results/sagd_bls_sim_torch_tanh_sigmoid_100_scale4_float64_results.csv`
+
+当前结论：
+
+新方法迁回电池实验后，有两个清晰结论：
+
+1. **PDE 字典不是电池最优字典**：`sin/tanh + 240/240 + map_scale=4` 在 SimData 上只达到 MAE `0.01823`，虽然超过 BattNN，但弱于旧 SAGD-BLS。
+2. **随机尺度思想可以迁移**：在电池更合适的 `tanh/sigmoid + 100/100` 上加入 `map_scale=4` 后，MAE 从旧 NumPy 记录的 `0.00562` 降到 `0.00517`，且标准差从 `0.00161` 降到 `0.00065`。
+
+需要谨慎表述：这不是把 PDE hard constraint 用在电池上，也不是新增模块；它只是把 BLS 变体内部的随机特征尺度和 torch/CUDA 输出层训练迁移到电池 adapter 上。电池任务仍然是工业验证，不是方法本体。

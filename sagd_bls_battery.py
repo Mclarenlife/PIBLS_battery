@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 import numpy as np
+import torch
 
 
 DEFAULT_RC_DECAYS = (0.99, 0.98, 0.95, 0.90, 0.80, 0.65, 0.50)
@@ -78,6 +79,11 @@ class SAGDBLS:
     learning_rate: float = 0.01
     epochs: int = 20_000
     l2: float = 1e-3
+    map_scale: float = 1.0
+    enhance_scale: float = 1.0
+    backend: str = "numpy"
+    device: str = "auto"
+    torch_dtype: str = "float32"
     smooth_l1_delta: float = 1.0
     rc_decays: tuple[float, ...] = field(default_factory=lambda: DEFAULT_RC_DECAYS)
     time_scale: float = 60.0
@@ -113,6 +119,14 @@ class SAGDBLS:
             raise ValueError("learning_rate must be positive.")
         if self.l2 < 0:
             raise ValueError("l2 must be non-negative.")
+        if self.map_scale <= 0 or self.enhance_scale <= 0:
+            raise ValueError("map_scale and enhance_scale must be positive.")
+        if self.backend not in {"numpy", "torch"}:
+            raise ValueError("backend must be 'numpy' or 'torch'.")
+        if self.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")
+        if self.torch_dtype not in {"float32", "float64"}:
+            raise ValueError("torch_dtype must be 'float32' or 'float64'.")
         if self.smooth_l1_delta <= 0:
             raise ValueError("smooth_l1_delta must be positive.")
 
@@ -283,11 +297,11 @@ class SAGDBLS:
 
     def _initialize_random_layers(self, n_features: int) -> None:
         rng = np.random.default_rng(self.seed)
-        self.W_map_ = rng.normal(0.0, 1.0 / np.sqrt(n_features), size=(n_features, self.n_map))
+        self.W_map_ = rng.normal(0.0, self.map_scale / np.sqrt(n_features), size=(n_features, self.n_map))
         self.b_map_ = rng.uniform(-1.0, 1.0, size=self.n_map)
         self.W_enhance_ = rng.normal(
             0.0,
-            1.0 / np.sqrt(self.n_map),
+            self.enhance_scale / np.sqrt(self.n_map),
             size=(self.n_map, self.n_enhance),
         )
         self.b_enhance_ = rng.uniform(-1.0, 1.0, size=self.n_enhance)
@@ -304,6 +318,9 @@ class SAGDBLS:
         return np.column_stack([np.ones(design.shape[0]), (design[:, 1:] - self.design_mean_) / self.design_std_])
 
     def _adam_output_fit(self, h_train: np.ndarray, y_scaled: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        if self.backend == "torch":
+            return self._adam_output_fit_torch(h_train, y_scaled, weights)
+
         beta = np.zeros(h_train.shape[1], dtype=np.float64)
         first_moment = np.zeros_like(beta)
         second_moment = np.zeros_like(beta)
@@ -334,6 +351,53 @@ class SAGDBLS:
                 loss = self._objective(h_train, y_scaled, weights, beta)
                 print(f"epoch={epoch:6d} loss={loss:.8f}")
         return beta
+
+    def _adam_output_fit_torch(self, h_train: np.ndarray, y_scaled: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        device = self._torch_device()
+        dtype = torch.float32 if self.torch_dtype == "float32" else torch.float64
+        h = torch.as_tensor(h_train, device=device, dtype=dtype)
+        y = torch.as_tensor(y_scaled, device=device, dtype=dtype)
+        w = torch.as_tensor(weights, device=device, dtype=dtype)
+        beta = torch.zeros(h.shape[1], device=device, dtype=dtype)
+        first_moment = torch.zeros_like(beta)
+        second_moment = torch.zeros_like(beta)
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+        n = float(y_scaled.size)
+
+        for epoch in range(1, self.epochs + 1):
+            pred = h @ beta
+            residual = pred - y
+            abs_residual = torch.abs(residual)
+            loss_grad = torch.where(
+                abs_residual < self.smooth_l1_delta,
+                residual / self.smooth_l1_delta,
+                torch.sign(residual),
+            )
+            grad = h.T @ (w * loss_grad) / n
+            grad = grad + self.l2 * beta
+
+            first_moment = beta1 * first_moment + (1.0 - beta1) * grad
+            second_moment = beta2 * second_moment + (1.0 - beta2) * (grad * grad)
+            m_hat = first_moment / (1.0 - beta1**epoch)
+            v_hat = second_moment / (1.0 - beta2**epoch)
+            beta = beta - self.learning_rate * m_hat / (torch.sqrt(v_hat) + eps)
+
+            if self.verbose and (epoch == 1 or epoch % 1000 == 0 or epoch == self.epochs):
+                loss = self._objective(h_train, y_scaled, weights, beta.detach().cpu().numpy())
+                print(f"epoch={epoch:6d} loss={loss:.8f}")
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return beta.detach().cpu().numpy().astype(np.float64)
+
+    def _torch_device(self) -> torch.device:
+        if self.device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but this Python environment has CPU-only torch.")
+        return torch.device(self.device)
 
     def _objective(
         self,

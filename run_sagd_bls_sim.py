@@ -10,6 +10,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -43,10 +44,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation", nargs=2, default=["sigmoid", "sigmoid"], metavar=("MAP", "ENHANCE"))
     parser.add_argument("--n-map", type=int, default=100)
     parser.add_argument("--n-enhance", type=int, default=100)
+    parser.add_argument("--map-scale", type=float, default=1.0)
+    parser.add_argument("--enhance-scale", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=20_000)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--l2", type=float, default=1e-3)
     parser.add_argument("--delta", type=float, default=1.0)
+    parser.add_argument("--backend", choices=["numpy", "torch"], default="numpy")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--torch-dtype", choices=["float32", "float64"], default="float32")
     parser.add_argument("--skip-ablation", action="store_true", help="Only run the requested activation pair.")
     parser.add_argument("--skip-checks", action="store_true", help="Skip quick implementation checks.")
     parser.add_argument(
@@ -151,6 +157,7 @@ def run_sagd_bls(args: argparse.Namespace) -> tuple[list[dict[str, object]], dic
 
     for map_act, enhance_act in configs:
         for seed in args.seeds:
+            start = time.perf_counter()
             model = SAGDBLS(
                 n_map=args.n_map,
                 n_enhance=args.n_enhance,
@@ -160,35 +167,48 @@ def run_sagd_bls(args: argparse.Namespace) -> tuple[list[dict[str, object]], dic
                 learning_rate=args.lr,
                 epochs=args.epochs,
                 l2=args.l2,
+                map_scale=args.map_scale,
+                enhance_scale=args.enhance_scale,
+                backend=args.backend,
+                device=args.device,
+                torch_dtype=args.torch_dtype,
                 smooth_l1_delta=args.delta,
             )
             model.fit(train_x, train_y, train_length=args.train_length)
             metrics = model.evaluate(iter_test_data(args.test_folder))
+            runtime_sec = time.perf_counter() - start
             row: dict[str, object] = {
                 "timestamp": timestamp,
-                "method": "SAGD-BLS",
+                "method": "SAGD-BLS" if args.backend == "numpy" else "SAGD-BLS-torch",
                 "dataset": "SimData",
                 "map_activation": map_act,
                 "enhance_activation": enhance_act,
                 "seed": seed,
                 "n_map": args.n_map,
                 "n_enhance": args.n_enhance,
+                "map_scale": args.map_scale,
+                "enhance_scale": args.enhance_scale,
                 "n_train": args.n_train,
                 "train_length": args.train_length,
                 "epochs": args.epochs,
                 "learning_rate": args.lr,
                 "l2": args.l2,
+                "backend": args.backend,
+                "device": args.device,
+                "torch_dtype": args.torch_dtype,
                 "smooth_l1_delta": args.delta,
                 "train_files": "|".join(train_files),
                 "initial_loss": model.training_summary_["initial_loss"],
                 "final_loss": model.training_summary_["final_loss"],
+                "runtime_sec": runtime_sec,
             }
             row.update(metrics)
             row.update(baseline)
             rows.append(row)
             print(
                 f"{map_act}/{enhance_act} seed={seed}: "
-                f"MAE={metrics['MAE']:.6f}, MAPE={metrics['MAPE']:.6f}, RMSE={metrics['RMSE']:.6f}"
+                f"MAE={metrics['MAE']:.6f}, MAPE={metrics['MAPE']:.6f}, RMSE={metrics['RMSE']:.6f}, "
+                f"time={runtime_sec:.2f}s"
             )
         summarize_config(rows, map_act, enhance_act, baseline)
     return rows, baseline
@@ -204,11 +224,13 @@ def summarize_config(
     mae = np.array([float(row["MAE"]) for row in subset])
     mape = np.array([float(row["MAPE"]) for row in subset])
     rmse = np.array([float(row["RMSE"]) for row in subset])
+    runtime = np.array([float(row.get("runtime_sec", 0.0)) for row in subset])
     message = (
         f"summary {map_act}/{enhance_act}: "
         f"MAE={mae.mean():.6f} +/- {mae.std():.6f}, "
         f"MAPE={mape.mean():.6f} +/- {mape.std():.6f}, "
-        f"RMSE={rmse.mean():.6f} +/- {rmse.std():.6f}"
+        f"RMSE={rmse.mean():.6f} +/- {rmse.std():.6f}, "
+        f"time={runtime.mean():.2f}s"
     )
     if baseline:
         message += f", BattNN MAE baseline={baseline['baseline_MAE_mean']:.6f}"
