@@ -498,7 +498,7 @@ SAGD-BLS 可以直接把 `u` 表示成固定随机基函数的线性组合：
 单 seed 运行命令：
 
 ```powershell
-.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --results-csv results\standard_burgers_single_seed_results.csv --summary-csv results\standard_burgers_single_seed_summary.csv
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-hard-sagd --results-csv results\standard_burgers_single_seed_results.csv --summary-csv results\standard_burgers_single_seed_summary.csv
 ```
 
 单 seed 结果：
@@ -524,3 +524,58 @@ SAGD-BLS 可以直接把 `u` 表示成固定随机基函数的线性组合：
 2. 对 collocation 点做自适应或残差重采样，增加陡峭过渡区域的训练密度。
 3. 尝试 Adam + L-BFGS 或分阶段学习率，改善非线性残差优化。
 4. 保持 BLS 结构边界不变：固定随机宽度特征 + 单线性输出层 `beta`，只改变 PDE 适配和优化策略。
+
+## 17. Hard-ICBC SAGD-BLS 改进记录
+
+基于第 16 节的结果，已在 `run_standard_burgers_experiment.py` 中加入硬约束版本：
+
+`SAGD-BLS-hard-ICBC`
+
+核心 trial solution 为：
+
+`u_hat(x,t) = (1-t)u0(x) + t(1-x^2)v_beta(x,t)`
+
+其中：
+
+- `u0(x)=-sin(pi x)`
+- `v_beta(x,t)=beta^T Phi(x,t)`
+- `Phi(x,t)` 仍然是固定随机 mapping nodes + enhancement nodes 的 BLS 宽度特征
+- 训练参数仍然只有单个线性输出层 `beta`
+
+这个形式解析满足：
+
+- `u_hat(x,0)=u0(x)`
+- `u_hat(-1,t)=0`
+- `u_hat(1,t)=0`
+
+因此初值和边界不再通过 soft penalty 拟合，而是由 trial solution 保证。训练目标只需要优化内部 Burgers residual 和 `beta` 正则项：
+
+`R = u_t + u u_x - nu u_xx`
+
+调参记录：
+
+| 方法/配置 | MAE | RMSE | residual_RMSE | IC MAXAE | BC MAXAE | 运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| PINN-standard-Burgers, 5000 epoch | 1.174917e-01 | 2.197461e-01 | 5.477191e-01 | 1.852849e-02 | 1.500989e-02 | 78.960s |
+| SAGD-BLS-standard-Burgers, soft IC/BC, 40000 epoch | 1.398185e-01 | 2.550852e-01 | 5.915243e-01 | 2.295649e-02 | 2.077347e-02 | 196.567s |
+| SAGD-BLS-hard-ICBC, 40000 epoch, lr=5e-4 | 1.135707e-01 | 2.237811e-01 | 5.617356e-01 | 0.000000e+00 | 1.224647e-16 | 534.594s |
+| SAGD-BLS-hard-ICBC, 15000 epoch, lr=1.5e-3 | 1.171445e-01 | 2.264927e-01 | 5.668843e-01 | 0.000000e+00 | 1.224647e-16 | 199.903s |
+
+结果文件：
+
+- `results/standard_burgers_hard_icbc_single_seed_results.csv`
+- `results/standard_burgers_hard_icbc_single_seed_summary.csv`
+- `results/standard_burgers_hard_icbc_lr15e4_15k_results.csv`
+- `results/standard_burgers_hard_icbc_lr15e4_15k_summary.csv`
+
+推荐配置运行命令：
+
+```powershell
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --results-csv results\standard_burgers_hard_icbc_lr15e4_15k_results.csv --summary-csv results\standard_burgers_hard_icbc_lr15e4_15k_summary.csv
+```
+
+当前结论：
+
+Hard-ICBC trial solution 是有效改进。最高精度配置的 MAE 从 soft 版的 `0.1398` 降到 `0.1136`，已经低于当前 PINN 单 seed 的 `0.1175`；推荐配置 `15000 epoch + lr=1.5e-3` 的 MAE 为 `0.1171`，也略低于 PINN，同时严格满足初值和边界条件。
+
+需要谨慎表述的是：Hard-ICBC 版本虽然在 MAE 上略优于当前 PINN，但 RMSE 和 residual_RMSE 仍略高于 PINN，运行时间也更长。因此这不是“全面碾压 PINN”，而是证明通用 BLS-PDE 方向在标准无源 Burgers 难例上已经从落后推进到可竞争。下一步应优先优化效率和陡峭区域误差。

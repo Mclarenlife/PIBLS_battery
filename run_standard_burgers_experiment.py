@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sagd-epochs", type=int, default=40_000)
     parser.add_argument("--sagd-lr", type=float, default=5e-4)
     parser.add_argument("--sagd-l2", type=float, default=1e-6)
+    parser.add_argument("--hard-sagd-epochs", type=int, default=15_000)
+    parser.add_argument("--hard-sagd-lr", type=float, default=1.5e-3)
     parser.add_argument("--ic-weight", type=float, default=100.0)
     parser.add_argument("--bc-weight", type=float, default=100.0)
     parser.add_argument("--pibls-ridge", type=float, default=1e-10)
@@ -59,6 +61,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pinn-hidden", type=int, default=64)
     parser.add_argument("--pinn-depth", type=int, default=4)
     parser.add_argument("--pinn-l2", type=float, default=0.0)
+    parser.add_argument("--skip-soft-sagd", action="store_true")
+    parser.add_argument("--skip-hard-sagd", action="store_true")
+    parser.add_argument("--skip-pibls", action="store_true")
     parser.add_argument("--skip-pinn", action="store_true")
     parser.add_argument("--torch-threads", type=int, default=0)
     return parser.parse_args()
@@ -243,6 +248,177 @@ class SAGDBLSStandardBurgers:
         }
 
 
+def trial_components(x: np.ndarray, t: np.ndarray) -> dict[str, np.ndarray]:
+    """Analytic IC/BC envelope for standard Burgers."""
+
+    u0 = initial_condition(x)
+    u0_x = -np.pi * np.cos(np.pi * x)
+    u0_xx = (np.pi**2) * np.sin(np.pi * x)
+    return {
+        "base": (1.0 - t) * u0,
+        "base_x": (1.0 - t) * u0_x,
+        "base_t": -u0,
+        "base_xx": (1.0 - t) * u0_xx,
+        "envelope": t * (1.0 - x * x),
+        "envelope_x": -2.0 * t * x,
+        "envelope_t": 1.0 - x * x,
+        "envelope_xx": -2.0 * t,
+    }
+
+
+@dataclass
+class SAGDBLSHardICBCStandardBurgers:
+    features: BroadFeature2D
+    nu: float
+    learning_rate: float
+    epochs: int
+    l2: float
+
+    beta_: np.ndarray | None = field(init=False, default=None)
+    training_summary_: dict[str, float] = field(init=False, default_factory=dict)
+
+    def fit(self, points: dict[str, np.ndarray]) -> "SAGDBLSHardICBCStandardBurgers":
+        self.features.fit(
+            np.concatenate([points["x_col"], points["x_ic"], points["x_bc"]]),
+            np.concatenate([points["t_col"], points["t_ic"], points["t_bc"]]),
+        )
+        phi, phi_x, phi_t, phi_xx = self.features.design_and_derivatives(points["x_col"], points["t_col"])
+        self.beta_ = self._adam_fit(points["x_col"], points["t_col"], phi, phi_x, phi_t, phi_xx)
+        self.training_summary_ = self.objective(
+            points["x_col"],
+            points["t_col"],
+            phi,
+            phi_x,
+            phi_t,
+            phi_xx,
+            points,
+            self.beta_,
+        )
+        return self
+
+    def predict(self, x: np.ndarray, t: np.ndarray) -> np.ndarray:
+        if self.beta_ is None:
+            raise ValueError("Model is not fitted.")
+        phi, _, _, _ = self.features.design_and_derivatives(x, t)
+        return self._u_and_derivatives(x, t, phi, None, None, None, self.beta_)["u"]
+
+    def residual(self, x: np.ndarray, t: np.ndarray) -> np.ndarray:
+        if self.beta_ is None:
+            raise ValueError("Model is not fitted.")
+        phi, phi_x, phi_t, phi_xx = self.features.design_and_derivatives(x, t)
+        values = self._u_and_derivatives(x, t, phi, phi_x, phi_t, phi_xx, self.beta_)
+        return values["u_t"] + values["u"] * values["u_x"] - self.nu * values["u_xx"]
+
+    def _adam_fit(
+        self,
+        x: np.ndarray,
+        t: np.ndarray,
+        phi: np.ndarray,
+        phi_x: np.ndarray,
+        phi_t: np.ndarray,
+        phi_xx: np.ndarray,
+    ) -> np.ndarray:
+        beta = np.zeros(phi.shape[1], dtype=np.float64)
+        m = np.zeros_like(beta)
+        v = np.zeros_like(beta)
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+        n_col = float(phi.shape[0])
+        for epoch in range(1, self.epochs + 1):
+            values = self._u_and_derivatives(x, t, phi, phi_x, phi_t, phi_xx, beta)
+            residual = values["u_t"] + values["u"] * values["u_x"] - self.nu * values["u_xx"]
+            jacobian = (
+                values["du_t"]
+                + values["u_x"][:, None] * values["du"]
+                + values["u"][:, None] * values["du_x"]
+                - self.nu * values["du_xx"]
+            )
+            grad = (2.0 / n_col) * (jacobian.T @ residual)
+            grad += self.l2 * beta
+
+            m = beta1 * m + (1.0 - beta1) * grad
+            v = beta2 * v + (1.0 - beta2) * (grad * grad)
+            beta -= self.learning_rate * (m / (1.0 - beta1**epoch)) / (np.sqrt(v / (1.0 - beta2**epoch)) + eps)
+        return beta
+
+    def objective(
+        self,
+        x: np.ndarray,
+        t: np.ndarray,
+        phi: np.ndarray,
+        phi_x: np.ndarray,
+        phi_t: np.ndarray,
+        phi_xx: np.ndarray,
+        points: dict[str, np.ndarray],
+        beta: np.ndarray,
+    ) -> dict[str, float]:
+        values = self._u_and_derivatives(x, t, phi, phi_x, phi_t, phi_xx, beta)
+        residual = values["u_t"] + values["u"] * values["u_x"] - self.nu * values["u_xx"]
+        phi_ic, _, _, _ = self.features.design_and_derivatives(points["x_ic"], points["t_ic"])
+        phi_bc, _, _, _ = self.features.design_and_derivatives(points["x_bc"], points["t_bc"])
+        ic_pred = self._u_and_derivatives(points["x_ic"], points["t_ic"], phi_ic, None, None, None, beta)["u"]
+        bc_pred = self._u_and_derivatives(points["x_bc"], points["t_bc"], phi_bc, None, None, None, beta)["u"]
+        ic_res = ic_pred - points["u_ic"]
+        bc_res = bc_pred - points["u_bc"]
+        residual_loss = float(np.mean(residual**2))
+        ic_loss = float(np.mean(ic_res**2))
+        bc_loss = float(np.mean(bc_res**2))
+        regularization = float(0.5 * self.l2 * np.dot(beta, beta))
+        return {
+            "loss": residual_loss + regularization,
+            "residual_loss": residual_loss,
+            "ic_loss": ic_loss,
+            "bc_loss": bc_loss,
+            "regularization": regularization,
+        }
+
+    @staticmethod
+    def _u_and_derivatives(
+        x: np.ndarray,
+        t: np.ndarray,
+        phi: np.ndarray,
+        phi_x: np.ndarray | None,
+        phi_t: np.ndarray | None,
+        phi_xx: np.ndarray | None,
+        beta: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        terms = trial_components(x, t)
+        v = phi @ beta
+        u = terms["base"] + terms["envelope"] * v
+        values: dict[str, np.ndarray] = {"u": u}
+        if phi_x is None or phi_t is None or phi_xx is None:
+            return values
+
+        v_x = phi_x @ beta
+        v_t = phi_t @ beta
+        v_xx = phi_xx @ beta
+        u_x = terms["base_x"] + terms["envelope_x"] * v + terms["envelope"] * v_x
+        u_t = terms["base_t"] + terms["envelope_t"] * v + terms["envelope"] * v_t
+        u_xx = (
+            terms["base_xx"]
+            + terms["envelope_xx"] * v
+            + 2.0 * terms["envelope_x"] * v_x
+            + terms["envelope"] * v_xx
+        )
+        values.update(
+            {
+                "u_x": u_x,
+                "u_t": u_t,
+                "u_xx": u_xx,
+                "du": terms["envelope"][:, None] * phi,
+                "du_x": terms["envelope_x"][:, None] * phi + terms["envelope"][:, None] * phi_x,
+                "du_t": terms["envelope_t"][:, None] * phi + terms["envelope"][:, None] * phi_t,
+                "du_xx": (
+                    terms["envelope_xx"][:, None] * phi
+                    + 2.0 * terms["envelope_x"][:, None] * phi_x
+                    + terms["envelope"][:, None] * phi_xx
+                ),
+            }
+        )
+        return values
+
+
 def evaluate_model(
     predict_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
     residual_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
@@ -271,6 +447,15 @@ def run_sagd(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray])
     model.fit(points)
     metrics = evaluate_model(model.predict, model.residual, points)
     return make_row(args, "SAGD-BLS-standard-Burgers", seed, time.perf_counter() - start, feature.width, model.training_summary_, metrics)
+
+
+def run_sagd_hard_icbc(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
+    start = time.perf_counter()
+    feature = BroadFeature2D(args.n_map, args.n_enhance, args.activation[0], args.activation[1], seed)
+    model = SAGDBLSHardICBCStandardBurgers(feature, args.nu, args.hard_sagd_lr, args.hard_sagd_epochs, args.sagd_l2)
+    model.fit(points)
+    metrics = evaluate_model(model.predict, model.residual, points)
+    return make_row(args, "SAGD-BLS-hard-ICBC", seed, time.perf_counter() - start, feature.width, model.training_summary_, metrics)
 
 
 def run_pibls_linearized(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
@@ -394,24 +579,27 @@ def make_row(
     training_summary: dict[str, object],
     metrics: dict[str, float],
 ) -> dict[str, object]:
+    is_bls = "BLS" in method or "PIBLS" in method
+    is_sagd = method == "SAGD-BLS-standard-Burgers"
+    is_hard_sagd = method == "SAGD-BLS-hard-ICBC"
     row = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "problem": "Standard unforced Burgers",
         "method": method,
         "seed": seed,
         "nu": args.nu,
-        "n_map": args.n_map if "BLS" in method or "PIBLS" in method else "",
-        "n_enhance": args.n_enhance if "BLS" in method or "PIBLS" in method else "",
-        "map_activation": args.activation[0] if "BLS" in method or "PIBLS" in method else "tanh",
-        "enhance_activation": args.activation[1] if "BLS" in method or "PIBLS" in method else "",
+        "n_map": args.n_map if is_bls else "",
+        "n_enhance": args.n_enhance if is_bls else "",
+        "map_activation": args.activation[0] if is_bls else "tanh",
+        "enhance_activation": args.activation[1] if is_bls else "",
         "n_collocation": args.n_collocation,
         "n_initial": args.n_initial,
         "n_boundary": args.n_boundary,
         "n_eval": metrics["n_eval"],
         "reference_grid": f"{args.n_ref_x}x{args.n_ref_t}",
-        "epochs": args.sagd_epochs if method == "SAGD-BLS-standard-Burgers" else (args.pinn_epochs if method == "PINN-standard-Burgers" else 0),
-        "learning_rate": args.sagd_lr if method == "SAGD-BLS-standard-Burgers" else (args.pinn_lr if method == "PINN-standard-Burgers" else ""),
-        "l2": args.sagd_l2 if method == "SAGD-BLS-standard-Burgers" else (args.pinn_l2 if method == "PINN-standard-Burgers" else args.pibls_ridge),
+        "epochs": args.sagd_epochs if is_sagd else (args.hard_sagd_epochs if is_hard_sagd else (args.pinn_epochs if method == "PINN-standard-Burgers" else 0)),
+        "learning_rate": args.sagd_lr if is_sagd else (args.hard_sagd_lr if is_hard_sagd else (args.pinn_lr if method == "PINN-standard-Burgers" else "")),
+        "l2": args.sagd_l2 if is_sagd or is_hard_sagd else (args.pinn_l2 if method == "PINN-standard-Burgers" else args.pibls_ridge),
         "ic_weight": args.ic_weight,
         "bc_weight": args.bc_weight,
         "trainable_parameters": trainable_parameters,
@@ -464,13 +652,20 @@ def main() -> None:
     rows: list[dict[str, object]] = []
     for seed in args.seeds:
         points = make_points(args, seed, reference)
-        sagd = run_sagd(args, seed, points)
-        rows.append(sagd)
-        print(f"SAGD-BLS-standard-Burgers seed={seed}: MAE={sagd['MAE']:.6e}, RMSE={sagd['RMSE']:.6e}")
+        if not args.skip_soft_sagd:
+            sagd = run_sagd(args, seed, points)
+            rows.append(sagd)
+            print(f"SAGD-BLS-standard-Burgers seed={seed}: MAE={sagd['MAE']:.6e}, RMSE={sagd['RMSE']:.6e}")
 
-        pibls = run_pibls_linearized(args, seed, points)
-        rows.append(pibls)
-        print(f"PIBLS-linearized-pinv seed={seed}: MAE={pibls['MAE']:.6e}, RMSE={pibls['RMSE']:.6e}")
+        if not args.skip_hard_sagd:
+            sagd_hard = run_sagd_hard_icbc(args, seed, points)
+            rows.append(sagd_hard)
+            print(f"SAGD-BLS-hard-ICBC seed={seed}: MAE={sagd_hard['MAE']:.6e}, RMSE={sagd_hard['RMSE']:.6e}")
+
+        if not args.skip_pibls:
+            pibls = run_pibls_linearized(args, seed, points)
+            rows.append(pibls)
+            print(f"PIBLS-linearized-pinv seed={seed}: MAE={pibls['MAE']:.6e}, RMSE={pibls['RMSE']:.6e}")
 
         if not args.skip_pinn:
             pinn = run_pinn(args, seed, points)
