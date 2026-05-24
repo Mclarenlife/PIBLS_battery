@@ -1,0 +1,2 @@
+MAE,MAXAE,RMSE,boundary_MAXAE,boundary_loss,boundary_weight,demo,enhance_activation,epochs,equation,l2,learning_rate,loss,map_activation,method,n_enhance,n_eval,n_interior,n_map,regularization,residual_RMSE,residual_loss,seed,timestamp
+0.0003430332673873293,0.0006040770406591015,0.0003822642608426186,0.0006040770406587227,3.4405099771626115e-07,100.0,1D Poisson,tanh,80000,"-u_xx=pi^2 sin(pi x), u(0)=u(1)=0",1e-06,0.0003,8.334428983074563e-05,tanh,SAGD-BLS-PDE,120,1000.0,128,120,2.165419008982598e-07,0.00790117862666095,4.872264815822127e-05,1,2026-05-25T00:58:14

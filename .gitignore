@@ -1,0 +1,12 @@
+XJTU battery dataset/
+The Dataset for Real-time personalized health status prediction of lithium-ion batteries using deep transfer learning/
+CALCE battery dataset/
+BattNN/
+Battery-dataset-preprocessing-code-library/
+
+.venv/
+__pycache__/
+.pydeps/
+*.pyc
+.pytest_cache/
+

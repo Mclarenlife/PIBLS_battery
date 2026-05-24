@@ -1,0 +1,417 @@
+# SAGD-BLS 通用 PDE 求解器定位记录
+
+记录日期：2026-05-25  
+当前目标：把 SAGD-BLS 从“电池实验模型”重新定位为“偏通用的 PDE/算子求解 BLS 变体”，并把电池单循环预测作为工业验证任务，而不是方法本体。
+
+## 1. 核心判断
+
+当前电池实验结果很好，但如果直接把现有 `current/cumsum/diff/RC-state/cycle` 特征写成方法主体，会显得方法是为电池任务专门设计的。这不符合导师给出的原始研究方向：研究一个宽度学习 BLS 变体，用于 PDE 求解，再用电池单循环预测作为工业测试。
+
+因此，后续研究叙述必须做一次抽象：
+
+- **方法本体**：通用的梯度下降宽度学习求解器。
+- **PDE 任务**：通过坐标输入、物理残差、边界/初值条件训练输出权重。
+- **电池任务**：作为工业验证，把电流时序和循环上下文看作外部 forcing/history 输入，用监督损失验证该 BLS 变体的小样本泛化能力。
+
+换句话说，电池实验不是 SAGD-BLS 的定义，而是 SAGD-BLS 的一个应用适配器。
+
+## 2. 推荐方法名称
+
+建议把研究主方法写成：
+
+**GD-BLS Solver** 或 **SAGD-BLS Solver**
+
+更完整的论文式名称：
+
+**State-Augmented Gradient-Descent Broad Learning System for PDE and Operator Approximation**
+
+中文：
+
+**面向 PDE 与算子逼近的状态增强梯度下降宽度学习系统**
+
+其中：
+
+- `State-Augmented` 不专指电池状态，而是指对基础坐标、边界条件、物理参数、外部 forcing、历史状态等信息的输入坐标扩展；
+- `Gradient-Descent` 表示输出权重不用伪逆/最小二乘，而通过梯度下降优化；
+- `Broad Learning System` 表示固定随机宽度特征 + 单线性输出层的结构约束。
+
+## 3. 通用方法本体
+
+设通用输入为：
+
+`z ∈ R^d`
+
+在 PDE 中，`z` 可以是：
+
+- 空间坐标 `x`
+- 时间坐标 `t`
+- PDE 参数 `μ`
+- 材料系数或源项参数
+- 边界标记或区域标记
+
+在电池任务中，`z` 可以是：
+
+- 时间坐标
+- 当前电流
+- 累积电流
+- 电流差分
+- 电流历史滤波状态
+- 循环级上下文
+
+通用 BLS 近似器为：
+
+`u_hat(z) = beta^T Phi(z)`
+
+其中 `Phi(z)` 是固定随机宽度特征：
+
+`Phi(z) = [1, z_scaled, H_map(z), H_enhance(z)]`
+
+映射层：
+
+`H_map(z) = sigma_map(z_scaled W_map + b_map)`
+
+增强层：
+
+`H_enhance(z) = sigma_enhance(H_map W_enhance + b_enhance)`
+
+训练参数只有：
+
+`beta`
+
+这就是需要固定的通用方法本体。
+
+## 4. 为什么它适合 PDE
+
+PDE 求解通常需要近似未知函数：
+
+`u(x, t)`
+
+或参数化算子：
+
+`u(x, t; μ)`
+
+SAGD-BLS 可以直接把 `u` 表示成固定随机基函数的线性组合：
+
+`u_hat(x, t; μ) = beta^T Phi(x, t, μ)`
+
+因为随机层固定，所以对坐标的导数可以转化为对固定特征的导数：
+
+`∂u_hat/∂x = beta^T ∂Phi/∂x`
+
+`∂²u_hat/∂x² = beta^T ∂²Phi/∂x²`
+
+这样可以构造 PDE 残差：
+
+`R(z) = N[u_hat](z) - f(z)`
+
+训练目标可以写成：
+
+`L = λ_r L_residual + λ_b L_boundary + λ_i L_initial + λ_d L_data + λ_reg ||beta||²`
+
+其中：
+
+- `L_residual`：内部 collocation 点 PDE 残差；
+- `L_boundary`：边界条件损失；
+- `L_initial`：初值条件损失；
+- `L_data`：可选观测数据损失；
+- `L_reg`：输出权重正则。
+
+此时梯度下降仍然只更新 `beta`。这保留了 BLS 的结构边界，同时避免了伪逆无法自然处理 PDE 残差、非均匀权重、多项损失的问题。
+
+## 5. PDE 适配器与电池适配器的关系
+
+需要把系统分成三层：
+
+### 5.1 通用 BLS 核心
+
+负责：
+
+- 初始化固定随机 mapping nodes；
+- 初始化固定随机 enhancement nodes；
+- 构造 `Phi(z)`；
+- 标准化输入和设计矩阵；
+- 用 Adam 优化输出权重 `beta`；
+- 提供预测接口。
+
+这一层不应该包含电池、电流、cycle、RC filter 等概念。
+
+### 5.2 PDE 适配器
+
+负责：
+
+- 生成 collocation 点；
+- 生成边界点和初值点；
+- 定义 PDE residual；
+- 计算或近似特征导数；
+- 组合残差损失、边界损失、初值损失；
+- 调用通用 BLS 核心训练 `beta`。
+
+示例 PDE：
+
+- Poisson 方程；
+- Heat 方程；
+- Burgers 方程；
+- Allen-Cahn 方程；
+- Helmholtz 方程。
+
+第一阶段不需要全面覆盖各种 PDE，但至少应做一个 toy PDE 来证明“这不是纯电池模型”。
+
+### 5.3 电池工业验证适配器
+
+负责：
+
+- 把电流序列转成状态增强输入；
+- 把 cycle/duration 转成低维上下文；
+- 使用监督电压损失训练；
+- 跑 BattNN SimData、Lab/NASA、XJTU；
+- 报告工业任务性能。
+
+这一层可以保留当前效果好的电池特征，但要明确写成“任务适配器”，不是主方法本体。
+
+## 6. 当前电池特征如何重新解释
+
+当前电池特征不应被解释为“方法核心”，而应解释为：
+
+**面向动态系统外部 forcing 的输入状态化策略。**
+
+对应关系：
+
+| 电池特征 | 通用解释 | PDE/算子中的类比 |
+| --- | --- | --- |
+| `current` | 外部 forcing 当前值 | 源项、输入载荷、边界驱动 |
+| `t` | 坐标 | 时间坐标 |
+| `cumsum(current)` | forcing 历史积分 | 累积通量、历史作用量 |
+| `diff(current)` | forcing 局部变化率 | 输入梯度、载荷变化 |
+| RC filtered states | 多尺度历史记忆 | 多尺度核特征、历史卷积近似 |
+| `cycle` | 工况/老化参数 | 参数化 PDE 中的 `μ` |
+| `duration` | 轨迹尺度信息 | 时间域长度或终止边界 |
+
+这样写之后，电池实验就不是“专门手工调特征”，而是“通用状态增强思想在工业时序系统上的一个实例”。
+
+## 7. 当前方法需要调整的叙述
+
+不要这样写：
+
+> 本文提出一种用于电池单循环预测的 SAGD-BLS，输入包括电流、累积电流、RC 滤波状态和循环序号。
+
+应该这样写：
+
+> 本文提出一种状态增强梯度下降宽度学习系统。该方法用固定随机宽度特征近似未知函数或算子，并用梯度下降训练单个线性输出层，从而可以统一处理监督数据损失与物理残差损失。对于 PDE，状态增强输入由坐标、参数、边界/初值信息构成；对于电池工业验证，状态增强输入由电流 forcing 及其多尺度历史坐标构成。
+
+## 8. 推荐技术路线
+
+### 阶段 A：冻结电池结果
+
+当前已经完成。
+
+冻结内容：
+
+- `SAGD-BLS-v2-cycle`
+- SimData 主结果；
+- Lab/NASA 支持结果；
+- XJTU Batch-1/Batch-5 tuned BattNN adapter 对比；
+- 中文冻结记录。
+
+### 阶段 B：抽离通用核心
+
+建议新增：
+
+- `sagd_bls_core.py`
+- `pde_sagd_bls.py`
+
+其中 `sagd_bls_core.py` 只包含通用 BLS 特征和 Adam 输出层训练，不出现 battery 字样。
+
+电池代码后续可以改成：
+
+- `battery_feature_adapter.py`
+- `run_sagd_bls_battery_*.py`
+
+### 阶段 C：做一个最小 PDE sanity check
+
+不需要马上“测试各种 PDE”，但至少需要一个 PDE toy problem，否则“偏通用 PDE 求解器”的说法没有支点。
+
+推荐第一个 PDE：
+
+**1D Poisson 方程**
+
+例如：
+
+`-u''(x) = π² sin(πx), x ∈ [0, 1]`
+
+边界：
+
+`u(0) = 0, u(1) = 0`
+
+解析解：
+
+`u(x) = sin(πx)`
+
+原因：
+
+- 一维；
+- 有解析解；
+- 边界简单；
+- 只需要二阶导；
+- 很适合验证固定随机特征 + beta 梯度下降是否能做 PDE residual training。
+
+### 阶段 D：再做一个时间 PDE 或非线性 PDE
+
+可选：
+
+- Heat equation；
+- Burgers equation；
+- Allen-Cahn equation。
+
+这一步用于证明方法不是只会做静态 ODE/PDE。
+
+### 阶段 E：电池作为工业验证
+
+在论文/报告结构中，电池实验放在：
+
+**Industrial Validation / Real-world Dynamic System Test**
+
+而不是放在主方法定义里。
+
+## 9. 建议论文或汇报结构
+
+推荐结构：
+
+1. 背景：PDE 求解和工业动态系统都需要小样本函数/算子逼近。
+2. 原始 BLS 局限：伪逆输出层难以自然适配物理残差、多项损失和加权优化。
+3. 方法：SAGD-BLS，用固定随机宽度特征 + Adam 输出层训练。
+4. 通用公式：`u_hat(z)=beta^T Phi(z)`。
+5. PDE 损失：残差、边界、初值、数据损失。
+6. 电池适配器：把电流 forcing 状态化，作为工业验证任务。
+7. 实验一：PDE toy sanity check。
+8. 实验二：BattNN SimData。
+9. 实验三：Lab/NASA/XJTU 工业测试。
+10. 消融：激活函数、cycle context、BattNN tuning。
+11. 局限与下一步。
+
+## 10. 当前结果如何重新命名
+
+当前文件 `SAGD_BLS_method_freeze_record.md` 记录的是：
+
+**Battery industrial validation record**
+
+而不是最终完整 PDE 方法记录。
+
+建议后续新增：
+
+`SAGD_BLS_pde_solver_record.md`
+
+该文件记录 PDE 求解器公式、PDE toy problem、残差训练和边界处理。
+
+## 11. 关键风险
+
+最大风险：
+
+如果继续只优化电池实验，方法会越来越像电池专用经验模型。
+
+规避方式：
+
+- 抽离通用 BLS 核心；
+- 至少完成一个 PDE toy problem；
+- 把电池特征写成 industrial adapter；
+- 把 `cycle context` 写成参数化输入，而不是电池专有 trick；
+- 不把 XJTU 结果作为“PDE 求解能力”的证据，只作为工业泛化能力证据。
+
+## 12. 当前建议
+
+当前不要再继续改电池特征。下一步应该是：
+
+1. 固定 `SAGD-BLS-v2-cycle` 电池结果；
+2. 抽象通用核心；
+3. 实现一个最小 PDE residual training demo；
+4. 再把电池实验作为应用验证接回主线。
+
+这样研究逻辑会更稳：
+
+**PDE/算子求解器是主体，电池实验是工业应用证明。**
+
+## 13. 新方法脚本
+
+已新增独立方法脚本：
+
+`sagd_bls_pde_solver.py`
+
+该脚本与当前电池实验脚本分离，不包含 `current/cycle/RC-state` 等电池专用概念。它的目标是研究通用 PDE 残差训练版 SAGD-BLS。
+
+当前脚本包含：
+
+- 通用 1D 固定随机宽度特征；
+- mapping nodes；
+- enhancement nodes；
+- 单个线性输出层 `beta`；
+- 对输入坐标的一阶和二阶解析导数；
+- PDE residual loss；
+- boundary loss；
+- Adam 训练输出权重；
+- 1D Poisson sanity check。
+
+当前 Poisson demo：
+
+`-u''(x) = pi^2 sin(pi x), x in [0, 1]`
+
+`u(0)=u(1)=0`
+
+解析解：
+
+`u(x)=sin(pi x)`
+
+运行命令：
+
+```powershell
+.venv\Scripts\python.exe sagd_bls_pde_solver.py --demo poisson --seed 1 --n-map 120 --n-enhance 120 --activation tanh tanh --epochs 80000 --lr 0.0003 --n-interior 128 --n-eval 1000
+```
+
+当前 tuned sanity check 结果：
+
+| 指标 | 数值 |
+| --- | ---: |
+| MAE | 3.430333e-04 |
+| RMSE | 3.822643e-04 |
+| MAXAE | 6.040770e-04 |
+| residual_RMSE | 7.901179e-03 |
+| boundary_MAXAE | 6.040770e-04 |
+
+结果文件：
+
+`results/sagd_bls_pde_poisson_demo.csv`
+
+这一步只证明新方法脚本已经从电池特征工程转向 PDE residual training。后续还需要继续做 Heat/Burgers 等时间或非线性 PDE，才能把“通用 PDE 求解器”的主张做扎实。
+
+## 14. PIBLS/PINN Baseline 测试
+
+已新增 baseline 比较脚本：
+
+`run_pde_solver_baselines.py`
+
+该脚本在同一个 1D Poisson 问题上比较三种方法：
+
+- `SAGD-BLS-PDE`：当前通用 PDE 求解器研究版本，固定随机宽度特征，Adam 训练单个输出层 `beta`；
+- `PIBLS-pinv`：与现有 `PIBLS.py` 思路一致的 1D physics-informed BLS baseline，用伪逆一次求解输出权重；
+- `PINN`：tanh MLP，用 PyTorch autograd 计算二阶导，并用 Adam 训练网络参数。
+
+正式五种子命令：
+
+```powershell
+.venv\Scripts\python.exe run_pde_solver_baselines.py --seeds 1 2 3 4 5 --sagd-epochs 80000 --sagd-lr 0.0003 --pinn-epochs 3000 --results-csv results\pde_poisson_baseline_results.csv --summary-csv results\pde_poisson_baseline_summary.csv
+```
+
+五种子结果：
+
+| 方法 | MAE | RMSE | residual_RMSE | boundary_MAXAE | 平均运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SAGD-BLS-PDE | 8.307034e-05 ± 1.31e-04 | 9.352520e-05 ± 1.45e-04 | 9.584249e-03 ± 1.47e-03 | 1.486046e-04 ± 2.30e-04 | 2.158s |
+| PIBLS-pinv | 3.926562e-04 ± 3.75e-04 | 4.624333e-04 ± 4.22e-04 | 1.762328e-02 ± 1.30e-02 | 8.259945e-04 ± 8.11e-04 | 0.037s |
+| PINN | 2.601692e-04 ± 4.67e-04 | 2.665535e-04 ± 4.65e-04 | 1.731177e-02 ± 4.43e-03 | 2.442223e-04 ± 4.82e-04 | 10.041s |
+
+结果文件：
+
+- `results/pde_poisson_baseline_results.csv`
+- `results/pde_poisson_baseline_summary.csv`
+
+当前结论：
+
+在这个最小 1D Poisson sanity check 上，调好学习率后的 SAGD-BLS-PDE 平均误差低于 PIBLS-pinv 和 3000 epoch PINN，并且比 PINN 更快。但这只是第一个 toy PDE，不能单独支撑“通用 PDE 求解器”结论。下一步应继续测试 Heat/Burgers 等时间或非线性 PDE。

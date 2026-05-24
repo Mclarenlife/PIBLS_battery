@@ -1,0 +1,17 @@
+dataset,candidate_id,profile,lr,weight_decay,validation_battery,validation_MAE
+XJTU-Batch-5,1,lab,0.01,0.0005,RW_battery-1,0.102603
+XJTU-Batch-5,2,lab,0.02,0.0005,RW_battery-1,0.102603
+XJTU-Batch-5,3,nasa,0.01,0.0005,RW_battery-1,0.117111
+XJTU-Batch-5,4,nasa,0.02,0.0005,RW_battery-1,0.117070
+XJTU-Batch-5,5,sim,0.01,0.0005,RW_battery-1,0.146821
+XJTU-Batch-5,6,sim,0.02,0.0005,RW_battery-1,0.146631
+XJTU-Batch-5,7,paper,0.01,0.0005,RW_battery-1,0.163756
+XJTU-Batch-5,8,paper,0.02,0.0005,RW_battery-1,0.167140
+XJTU-Batch-1,1,lab,0.01,0.0005,2C_battery-1,0.157599
+XJTU-Batch-1,2,lab,0.02,0.0005,2C_battery-1,0.157906
+XJTU-Batch-1,3,nasa,0.01,0.0005,2C_battery-1,0.165156
+XJTU-Batch-1,4,nasa,0.02,0.0005,2C_battery-1,0.168713
+XJTU-Batch-1,5,sim,0.01,0.0005,2C_battery-1,0.239442
+XJTU-Batch-1,6,sim,0.02,0.0005,2C_battery-1,0.239611
+XJTU-Batch-1,7,paper,0.01,0.0005,2C_battery-1,0.273862
+XJTU-Batch-1,8,paper,0.02,0.0005,2C_battery-1,0.277630
