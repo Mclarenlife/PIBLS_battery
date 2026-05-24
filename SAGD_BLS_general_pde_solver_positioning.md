@@ -695,3 +695,51 @@ stationary base 的方向是正确的，但提升很小。15k 配置的 MAE 从 
 1. 增大宽度，例如 `n_map=240,n_enhance=240`，验证特征容量是否继续改善陡峭区。
 2. 只优化 `beta` 的 L-BFGS/Adam 分阶段训练，验证 residual 是否能下降。
 3. 做三 seed 稳定性，但先不要引入残差重采样或外部 shock detector。
+
+## 20. 宽度与 beta 正则消融
+
+在第 19 节确定 `sin/tanh + map_scale=4.0 + stationary hard trial` 后，本轮只继续调整 BLS 变体内部的两个因素：
+
+- 宽度容量：`n_map/n_enhance`
+- 输出层正则：`beta` 的 L2 系数
+
+没有增加外部模块，也没有训练随机映射层或增强层。结构仍然是：
+
+`u_hat(x,t)=u0(x)+t(1-x^2) beta^T Phi(x,t)`
+
+筛选汇总文件：
+
+`results/standard_burgers_width_regularization_summary.csv`
+
+快筛与正式结果：
+
+| 配置 | epoch | MAE | RMSE | residual_RMSE | 运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 160/160, l2=1e-6 | 15000 | 9.257081e-02 | 1.900109e-01 | 5.841477e-01 | 198.316s |
+| 240/240, l2=1e-6 | 5000 | 8.817378e-02 | 1.820099e-01 | 6.035866e-01 | 102.199s |
+| 320/320, l2=1e-6 | 5000 | 9.279479e-02 | 2.057059e-01 | 6.463591e-01 | 137.880s |
+| 240/240, l2=1e-4 | 5000 | 8.822614e-02 | 1.821357e-01 | 6.031997e-01 | 102.971s |
+| 240/240, l2=1e-3 | 5000 | 8.827229e-02 | 1.823723e-01 | 5.999245e-01 | 103.364s |
+| 240/240, l2=1e-2 | 5000 | 8.972433e-02 | 1.854303e-01 | 5.826877e-01 | 103.339s |
+| 240/240, l2=1e-6 | 15000 | 8.669216e-02 | 1.788374e-01 | 6.322830e-01 | 306.106s |
+| 240/240, l2=1e-2 | 15000 | 8.894163e-02 | 1.837938e-01 | 5.833702e-01 | 305.352s |
+
+正式结果文件：
+
+- `results/standard_burgers_width_sin_tanh_s4_w240_15k_results.csv`
+- `results/standard_burgers_width_sin_tanh_s4_w240_15k_summary.csv`
+- `results/standard_burgers_width_sin_tanh_s4_w240_l2e2_15k_results.csv`
+- `results/standard_burgers_width_sin_tanh_s4_w240_l2e2_15k_summary.csv`
+
+当前结论：
+
+`240/240` 是当前比 `160/160` 更好的宽度容量，MAE 从 `0.0926` 进一步降到 `0.0867`，RMSE 从 `0.1900` 降到 `0.1788`。但 `320/320` 在 5k 快筛中反而变差，说明简单加宽不是单调收益。
+
+L2 正则提供了一个有用的折中：`240/240, l2=1e-2` 的 MAE 为 `0.0889`，略差于 `l2=1e-6` 的 `0.0867`，但 residual_RMSE 从 `0.6323` 降到 `0.5834`。这更接近当前 PINN 的 residual 表现，同时仍明显优于 PINN 的 MAE/RMSE。
+
+因此当前可以保留两个推荐配置：
+
+- **最佳拟合配置**：`sin/tanh, map_scale=4, n_map=240, n_enhance=240, l2=1e-6`
+- **拟合-残差折中配置**：`sin/tanh, map_scale=4, n_map=240, n_enhance=240, l2=1e-2`
+
+下一步建议先做三 seed 稳定性验证，而不是继续堆新技巧。若三 seed 仍稳定优于 PINN 的 MAE/RMSE，就可以把 HC-SAGD-BLS 的标准 Burgers 结果作为主要 PDE 证据之一。
