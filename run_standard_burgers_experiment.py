@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-map", type=int, default=160)
     parser.add_argument("--n-enhance", type=int, default=160)
     parser.add_argument("--activation", nargs=2, default=["tanh", "tanh"], metavar=("MAP", "ENHANCE"))
+    parser.add_argument("--map-scale", type=float, default=1.0)
+    parser.add_argument("--enhance-scale", type=float, default=1.0)
     parser.add_argument("--n-collocation", type=int, default=1200)
     parser.add_argument("--n-initial", type=int, default=160)
     parser.add_argument("--n-boundary", type=int, default=160)
@@ -454,9 +456,21 @@ def evaluate_model(
     return metrics
 
 
+def make_feature(args: argparse.Namespace, seed: int) -> BroadFeature2D:
+    return BroadFeature2D(
+        args.n_map,
+        args.n_enhance,
+        args.activation[0],
+        args.activation[1],
+        seed,
+        args.map_scale,
+        args.enhance_scale,
+    )
+
+
 def run_sagd(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
     start = time.perf_counter()
-    feature = BroadFeature2D(args.n_map, args.n_enhance, args.activation[0], args.activation[1], seed)
+    feature = make_feature(args, seed)
     model = SAGDBLSStandardBurgers(feature, args.nu, args.sagd_lr, args.sagd_epochs, args.sagd_l2, args.ic_weight, args.bc_weight)
     model.fit(points)
     metrics = evaluate_model(model.predict, model.residual, points)
@@ -465,7 +479,7 @@ def run_sagd(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray])
 
 def run_sagd_hard_icbc(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
     start = time.perf_counter()
-    feature = BroadFeature2D(args.n_map, args.n_enhance, args.activation[0], args.activation[1], seed)
+    feature = make_feature(args, seed)
     model = SAGDBLSHardICBCStandardBurgers(
         feature,
         args.nu,
@@ -482,7 +496,7 @@ def run_sagd_hard_icbc(args: argparse.Namespace, seed: int, points: dict[str, np
 
 def run_pibls_linearized(args: argparse.Namespace, seed: int, points: dict[str, np.ndarray]) -> dict[str, object]:
     start = time.perf_counter()
-    feature = BroadFeature2D(args.n_map, args.n_enhance, args.activation[0], args.activation[1], seed)
+    feature = make_feature(args, seed)
     feature.fit(
         np.concatenate([points["x_col"], points["x_ic"], points["x_bc"]]),
         np.concatenate([points["t_col"], points["t_ic"], points["t_bc"]]),
@@ -614,6 +628,8 @@ def make_row(
         "n_enhance": args.n_enhance if is_bls else "",
         "map_activation": args.activation[0] if is_bls else "tanh",
         "enhance_activation": args.activation[1] if is_bls else "",
+        "map_scale": args.map_scale if is_bls else "",
+        "enhance_scale": args.enhance_scale if is_bls else "",
         "hard_trial": args.hard_trial if is_hard_sagd else "",
         "n_collocation": args.n_collocation,
         "n_initial": args.n_initial,

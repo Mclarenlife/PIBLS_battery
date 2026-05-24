@@ -1,0 +1,2 @@
+MAE_mean,MAE_std,MAXAE_mean,MAXAE_std,RMSE_mean,RMSE_std,bc_MAXAE_mean,bc_MAXAE_std,ic_MAXAE_mean,ic_MAXAE_std,method,n,problem,residual_RMSE_mean,residual_RMSE_std,runtime_sec_mean,runtime_sec_std,trainable_parameters
+0.09257080790191287,0.0,0.9448464067385405,0.0,0.19001085335448029,0.0,1.2246467991473532e-16,0.0,0.0,0.0,SAGD-BLS-hard-ICBC-stationary,1,Standard unforced Burgers,0.5841477129488556,0.0,198.31645070000377,0.0,323

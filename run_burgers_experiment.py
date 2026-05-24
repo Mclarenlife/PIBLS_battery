@@ -126,6 +126,8 @@ class BroadFeature2D:
     map_activation: str
     enhance_activation: str
     seed: int
+    map_scale: float = 1.0
+    enhance_scale: float = 1.0
 
     input_mean_: np.ndarray | None = field(init=False, default=None)
     input_std_: np.ndarray | None = field(init=False, default=None)
@@ -141,9 +143,13 @@ class BroadFeature2D:
         self.input_mean_ = z.mean(axis=0)
         self.input_std_ = z.std(axis=0) + 1e-8
         rng = np.random.default_rng(self.seed)
-        self.W_map_ = rng.normal(0.0, 1.0 / np.sqrt(2), size=(2, self.n_map))
+        self.W_map_ = rng.normal(0.0, self.map_scale / np.sqrt(2), size=(2, self.n_map))
         self.b_map_ = rng.uniform(-1.0, 1.0, size=self.n_map)
-        self.W_enhance_ = rng.normal(0.0, 1.0 / np.sqrt(self.n_map), size=(self.n_map, self.n_enhance))
+        self.W_enhance_ = rng.normal(
+            0.0,
+            self.enhance_scale / np.sqrt(self.n_map),
+            size=(self.n_map, self.n_enhance),
+        )
         self.b_enhance_ = rng.uniform(-1.0, 1.0, size=self.n_enhance)
         raw, _, _, _ = self.raw_design_and_derivatives(x, t)
         self.design_mean_ = raw[:, 1:].mean(axis=0)

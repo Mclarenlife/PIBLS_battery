@@ -627,3 +627,71 @@ stationary base 的方向是正确的，但提升很小。15k 配置的 MAE 从 
 1. 特征字典本体：宽度、激活函数、随机权重尺度、输入缩放。
 2. 输出层优化：仍然只优化 `beta`，可比较 Adam、L-BFGS 或二者的 beta-only 阶段化优化。
 3. 硬约束表达：保留 stationary base 作为默认 hard trial，因为它更自然且略优。
+
+## 19. BLS 特征字典尺度消融
+
+为继续提升标准无源 Burgers 效果，同时避免方法变成模块拼接，本轮只调整 BLS 变体内部的特征字典：
+
+- mapping activation
+- enhancement activation
+- mapping random weight scale
+- enhancement random weight scale
+
+这些参数只改变固定随机宽度特征 `Phi(x,t)` 的构造，不引入新网络、不训练 `W_map/W_enhance`，训练参数仍然只有单个输出层 `beta`。
+
+脚本改动：
+
+- `run_burgers_experiment.py` 中的 `BroadFeature2D` 新增 `map_scale` 和 `enhance_scale`，默认值均为 `1.0`，因此旧实验默认行为不变。
+- `run_standard_burgers_experiment.py` 新增命令行参数 `--map-scale` 和 `--enhance-scale`，并把这两个字段写入结果 CSV。
+
+5k epoch 筛选结果：
+
+| 配置 | MAE | RMSE | residual_RMSE | 运行时间 |
+| --- | ---: | ---: | ---: | ---: |
+| tanh/tanh, map_scale=1 | 1.223981e-01 | 2.342671e-01 | 5.765069e-01 | 68.574s |
+| tanh/tanh, map_scale=2 | 1.075859e-01 | 2.180669e-01 | 5.463120e-01 | 67.588s |
+| tanh/tanh, map_scale=4 | 1.071247e-01 | 2.242364e-01 | 5.578916e-01 | 67.396s |
+| sin/tanh, map_scale=1 | 1.282663e-01 | 2.354923e-01 | 5.814488e-01 | 66.935s |
+| sin/tanh, map_scale=2 | 1.048212e-01 | 2.146157e-01 | 5.594923e-01 | 67.545s |
+| sin/tanh, map_scale=3 | 9.540739e-02 | 1.990151e-01 | 5.712648e-01 | 67.237s |
+| sin/tanh, map_scale=4 | 9.372608e-02 | 1.924321e-01 | 5.761810e-01 | 67.190s |
+| sin/tanh, map_scale=6 | 1.018409e-01 | 2.250251e-01 | 6.684430e-01 | 67.747s |
+| sin/tanh, map_scale=4, enhance_scale=0.5 | 1.010565e-01 | 2.208283e-01 | 5.754716e-01 | 67.570s |
+| sin/tanh, map_scale=4, enhance_scale=2 | 1.011908e-01 | 2.068943e-01 | 6.276867e-01 | 67.559s |
+
+筛选汇总文件：
+
+`results/standard_burgers_feature_dictionary_screen_summary.csv`
+
+当前最佳特征字典：
+
+`map_activation=sin, enhance_activation=tanh, map_scale=4.0, enhance_scale=1.0`
+
+正式 15k 单 seed 命令：
+
+```powershell
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --skip-soft-sagd --skip-pibls --skip-pinn --hard-trial stationary --hard-sagd-epochs 15000 --hard-sagd-lr 0.0015 --activation sin tanh --map-scale 4.0 --enhance-scale 1.0 --results-csv results\standard_burgers_feature_sin_tanh_s4_15k_results.csv --summary-csv results\standard_burgers_feature_sin_tanh_s4_15k_summary.csv
+```
+
+正式 15k 结果：
+
+| 方法/配置 | MAE | RMSE | residual_RMSE | IC MAXAE | BC MAXAE | 运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| PINN-standard-Burgers, 5000 epoch | 1.174917e-01 | 2.197461e-01 | 5.477191e-01 | 1.852849e-02 | 1.500989e-02 | 78.960s |
+| HC-SAGD-BLS, tanh/tanh, map_scale=1, 15000 epoch | 1.170710e-01 | 2.265148e-01 | 5.668790e-01 | 0.000000e+00 | 1.224647e-16 | 197.753s |
+| HC-SAGD-BLS, sin/tanh, map_scale=4, 15000 epoch | 9.257081e-02 | 1.900109e-01 | 5.841477e-01 | 0.000000e+00 | 1.224647e-16 | 198.316s |
+
+结果文件：
+
+- `results/standard_burgers_feature_sin_tanh_s4_15k_results.csv`
+- `results/standard_burgers_feature_sin_tanh_s4_15k_summary.csv`
+
+当前结论：
+
+这轮改进是有效且边界清晰的。把 mapping activation 从 `tanh` 换成 `sin`，并把 `map_scale` 提高到 `4.0` 后，标准无源 Burgers 单 seed MAE 从 `0.1171` 降到 `0.0926`，RMSE 从 `0.2265` 降到 `0.1900`，已经明显优于当前 PINN 的 MAE/RMSE。
+
+需要保留的谨慎点：`residual_RMSE` 仍高于 PINN，说明特征字典改善了参考解拟合误差，但 PDE residual 的全局均方还没有同步超过 PINN。后续可以继续只在 BLS 内部优化：
+
+1. 增大宽度，例如 `n_map=240,n_enhance=240`，验证特征容量是否继续改善陡峭区。
+2. 只优化 `beta` 的 L-BFGS/Adam 分阶段训练，验证 residual 是否能下降。
+3. 做三 seed 稳定性，但先不要引入残差重采样或外部 shock detector。
