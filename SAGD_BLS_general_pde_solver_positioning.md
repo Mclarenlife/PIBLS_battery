@@ -415,3 +415,63 @@ SAGD-BLS 可以直接把 `u` 表示成固定随机基函数的线性组合：
 当前结论：
 
 在这个最小 1D Poisson sanity check 上，调好学习率后的 SAGD-BLS-PDE 平均误差低于 PIBLS-pinv 和 3000 epoch PINN，并且比 PINN 更快。但这只是第一个 toy PDE，不能单独支撑“通用 PDE 求解器”结论。下一步应继续测试 Heat/Burgers 等时间或非线性 PDE。
+
+## 15. Forced Burgers 非线性 PDE 测试
+
+已新增 Burgers 实验脚本：
+
+`run_burgers_experiment.py`
+
+测试问题为带解析解的 forced Burgers：
+
+`u_t + u u_x - nu u_xx = f(x,t), x in [-1,1], t in [0,1]`
+
+解析解：
+
+`u(x,t) = -sin(pi x) exp(-t)`
+
+边界和初值：
+
+- `u(-1,t)=0`
+- `u(1,t)=0`
+- `u(x,0)=-sin(pi x)`
+
+粘性系数：
+
+`nu = 0.01 / pi`
+
+选择 forced Burgers 的原因：
+
+- 保留 Burgers 的非线性项 `u u_x`；
+- 有解析解，可直接评估 MAE/RMSE/MAXAE；
+- 可以同时计算 PDE residual、初值误差和边界误差；
+- 适合作为从线性 Poisson 走向非线性 PDE 的第一步。
+
+比较方法：
+
+- `SAGD-BLS-Burgers`：固定随机宽度特征，Adam 只训练输出 `beta`，直接优化非线性 Burgers residual + IC/BC；
+- `PIBLS-linearized-pinv`：PIBLS 风格伪逆基线，只解线性化残差 `u_t - nu u_xx = f`，因为原始 pinv-PIBLS 对 `u u_x` 这种非线性 beta residual 不能直接一次伪逆求解；
+- `PINN-Burgers`：tanh MLP，用 PyTorch autograd 训练完整非线性 residual。
+
+运行命令：
+
+```powershell
+.venv\Scripts\python.exe run_burgers_experiment.py --seeds 1 2 3 --results-csv results\burgers_baseline_results.csv --summary-csv results\burgers_baseline_summary.csv
+```
+
+三种子结果：
+
+| 方法 | MAE | RMSE | residual_RMSE | IC MAXAE | BC MAXAE | 平均运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SAGD-BLS-Burgers | 4.073106e-03 ± 9.14e-04 | 5.094749e-03 ± 1.15e-03 | 4.054669e-02 ± 4.36e-03 | 5.450117e-03 ± 1.30e-03 | 5.713737e-03 ± 1.68e-03 | 192.888s |
+| PINN-Burgers | 1.044180e-02 ± 4.11e-03 | 1.290501e-02 ± 4.62e-03 | 5.371159e-02 ± 8.47e-03 | 2.214875e-02 ± 1.76e-02 | 2.141384e-02 ± 1.78e-02 | 77.869s |
+| PIBLS-linearized-pinv | 2.687259e-01 ± 2.29e-04 | 3.243791e-01 ± 2.11e-04 | 1.162437e+00 ± 1.37e-03 | 1.877545e-04 ± 9.90e-05 | 3.976104e-04 ± 2.47e-04 | 0.971s |
+
+结果文件：
+
+- `results/burgers_baseline_results.csv`
+- `results/burgers_baseline_summary.csv`
+
+当前 Burgers 结论：
+
+在这个 forced Burgers 非线性 PDE 上，SAGD-BLS-Burgers 的误差低于当前 PINN-Burgers baseline，并显著优于只能处理线性化残差的 PIBLS-pinv baseline。缺点是当前 NumPy 全量 Adam 实现较慢，平均运行时间高于 PINN。下一步可以从小批量 collocation、L-BFGS/Adam 混合优化、特征缩放和更稳的初始化入手优化效率。
