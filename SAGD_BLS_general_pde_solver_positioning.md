@@ -475,3 +475,52 @@ SAGD-BLS 可以直接把 `u` 表示成固定随机基函数的线性组合：
 当前 Burgers 结论：
 
 在这个 forced Burgers 非线性 PDE 上，SAGD-BLS-Burgers 的误差低于当前 PINN-Burgers baseline，并显著优于只能处理线性化残差的 PIBLS-pinv baseline。缺点是当前 NumPy 全量 Adam 实现较慢，平均运行时间高于 PINN。下一步可以从小批量 collocation、L-BFGS/Adam 混合优化、特征缩放和更稳的初始化入手优化效率。
+
+## 16. Standard Unforced Burgers 单 seed 验证
+
+为回答“当前 Burgers 难度是否太简单”的问题，新增标准无源 Burgers 实验脚本：
+
+`run_standard_burgers_experiment.py`
+
+测试问题：
+
+`u_t + u u_x - nu u_xx = 0, x in [-1,1], t in [0,1]`
+
+初值和边界：
+
+- `u(x,0) = -sin(pi x)`
+- `u(-1,t)=0`
+- `u(1,t)=0`
+- `nu = 0.01 / pi`
+
+这个问题不再使用 manufactured source，因此没有直接解析解。当前脚本用有限体积/有限差分 method-of-lines 生成参考解：对流项使用保守型 Rusanov 数值通量，扩散项使用二阶中心差分，再用 `scipy.solve_ivp` 求解时间推进。这样避免了低粘性 Burgers 中裸中心差分对对流项不稳定的问题。
+
+单 seed 运行命令：
+
+```powershell
+.venv\Scripts\python.exe run_standard_burgers_experiment.py --seeds 1 --results-csv results\standard_burgers_single_seed_results.csv --summary-csv results\standard_burgers_single_seed_summary.csv
+```
+
+单 seed 结果：
+
+| 方法 | MAE | RMSE | MAXAE | residual_RMSE | IC MAXAE | BC MAXAE | 运行时间 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| PINN-standard-Burgers | 1.174917e-01 | 2.197461e-01 | 9.252207e-01 | 5.477191e-01 | 1.852849e-02 | 1.500989e-02 | 78.960s |
+| SAGD-BLS-standard-Burgers | 1.398185e-01 | 2.550852e-01 | 9.872398e-01 | 5.915243e-01 | 2.295649e-02 | 2.077347e-02 | 196.567s |
+| PIBLS-linearized-pinv | 2.846471e-01 | 3.470212e-01 | 8.559041e-01 | 1.074628e+00 | 1.895792e-06 | 2.757466e-06 | 1.211s |
+
+结果文件：
+
+- `results/standard_burgers_single_seed_results.csv`
+- `results/standard_burgers_single_seed_summary.csv`
+
+当前结论：
+
+标准无源 Burgers 明显比 forced Burgers 更难。forced Burgers 中，SAGD-BLS 在有解析制造解和源项约束的情形下优于 PINN；但在标准无源 Burgers 单 seed 上，当前通用 SAGD-BLS 版本暂时没有超过 PINN，MAE 为 `0.1398`，PINN 为 `0.1175`。三个方法的 MAXAE 都接近 1，说明误差主要来自低粘性 Burgers 的陡峭过渡区域，而不是简单边界拟合失败。
+
+这个结果对研究路线是有价值的：它证明 forced Burgers 不能单独作为“通用 PDE 求解能力”的强证据，后续需要在标准无源 Burgers 上继续改进。优先方向包括：
+
+1. 引入硬约束 trial solution，使初值和边界条件解析满足，只让 BLS 输出层学习内部自由函数。
+2. 对 collocation 点做自适应或残差重采样，增加陡峭过渡区域的训练密度。
+3. 尝试 Adam + L-BFGS 或分阶段学习率，改善非线性残差优化。
+4. 保持 BLS 结构边界不变：固定随机宽度特征 + 单线性输出层 `beta`，只改变 PDE 适配和优化策略。
